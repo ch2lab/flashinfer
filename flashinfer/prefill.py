@@ -3070,7 +3070,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     )
                     for name in self._jit_additional_scalar_names[scalar_start:]:
                         additional_args.append(jit_scalar_values[name])
-                        additional_args.append(jit_scalar_values[name])
                 run_args.extend(additional_args)
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
