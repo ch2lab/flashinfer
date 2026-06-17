@@ -3046,7 +3046,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                              k_stride_n, 0, chunk_size, tid);
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                    k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+                                    k_stride_n, k_stride_h, 0,
+                                    chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
       if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
         // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
