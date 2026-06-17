@@ -3064,23 +3064,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "scale_v_scalar": scale_v_scalar,
                         "token_pos_in_items_len": self._token_pos_in_items_len,
                     }
-                    # prepare_jit_additional_args returns one entry per declared
-                    # tensor name plus any scalars the caller passed
-                    # positionally, so the number of scalars already provided is
-                    # exactly the excess over the tensor-name count.
-                    num_scalars_provided = len(additional_args) - len(
-                        self._jit_additional_tensor_names
+                    scalar_start = max(
+                        0,
+                        len(additional_args) - len(self._jit_additional_tensor_names),
                     )
-                    for name in self._jit_additional_scalar_names[
-                        num_scalars_provided:
-                    ]:
-                        if name not in jit_scalar_values:
-                            raise ValueError(
-                                f"JIT module declares additional scalar {name!r}, "
-                                "which was not passed positionally to run() and "
-                                "cannot be derived automatically; derivable "
-                                f"scalars are: {sorted(jit_scalar_values)}"
-                            )
+                    for name in self._jit_additional_scalar_names[scalar_start:]:
+                        additional_args.append(jit_scalar_values[name])
                         additional_args.append(jit_scalar_values[name])
                 run_args.extend(additional_args)
             else:
@@ -4130,7 +4119,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # dtype is just plan()'s q_data_type default, so fall back to bf16.
         out_dtype = getattr(self, "_cached_o_data_type", None)
         if out_dtype is None or out_dtype.itemsize == 1:
-            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
+            if out is None:
+                # when input dtype is fp8, we need to use bf16 output
+                out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
         if out is None:
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,),

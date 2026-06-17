@@ -497,7 +497,11 @@ struct vec_cast<float, __nv_fp4x2_e2m1> {
     }
 #else
     constexpr float lut[16] = {
+<<<<<<< HEAD
         0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+=======
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+>>>>>>> d4ff3dc1 (feat(attention): NVFP4 KV cache read path for FA2 paged attention (SM120))
         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
     };
 #pragma unroll
@@ -1220,7 +1224,13 @@ struct vec_t<__nv_fp4x2_e2m1, vec_size> {
   static_assert(vec_size % 16 == 0, "Invalid vector size");
   int4 data[vec_size / 16];
 
+<<<<<<< HEAD
   FLASHINFER_INLINE __nv_fp4x2_e2m1& operator[](size_t i) { return ((__nv_fp4x2_e2m1*)data)[i]; }
+=======
+  FLASHINFER_INLINE __nv_fp4x2_e2m1& operator[](size_t i) {
+    return ((__nv_fp4x2_e2m1*)data)[i];
+  }
+>>>>>>> d4ff3dc1 (feat(attention): NVFP4 KV cache read path for FA2 paged attention (SM120))
   FLASHINFER_INLINE const __nv_fp4x2_e2m1& operator[](size_t i) const {
     return ((const __nv_fp4x2_e2m1*)data)[i];
   }
