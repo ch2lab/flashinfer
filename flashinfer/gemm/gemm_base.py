@@ -7781,12 +7781,14 @@ def _heuristic_func_mm_fp4(
     enable_pdl: bool = True,  # unused
 ):
     r"""
-    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
+    Heuristic function for mm_fp4 backend selection.
     Note: trtllm is not considered in the backend selection because it requires a specific
     input quantization (swizzling/shuffling) that differs from the preparation used
     for cudnn and cutlass backends.
 
     Logic for which comes first:
+    - If CUDA version is 13+ and device is SM12x with NVFP4 - use b12x,
+      then cutlass, then cudnn.
     - If cuda version is 12 - use cutlass.
     - If cuda version is 13 and cudnn version is less than 9.15 - use cutlass.
     - If cuda version is 13 and cudnn version is 9.15 or greater:
@@ -7799,7 +7801,7 @@ def _heuristic_func_mm_fp4(
     major, minor = get_compute_capability(a.device)
     is_sm107 = major == 10 and minor == 7
     is_sm103 = major == 10 and minor == 3
-    is_sm120 = major == 12 and minor == 0
+    is_sm12x = major == 12
 
     # SM120 prefers b12x from CUDA 12.9 for NVFP4 and CUDA 13 for MXFP4.
     # SM121 (GB10) is intentionally excluded from automatic selection because
@@ -8017,7 +8019,7 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"]
-        Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
+        Backend to use, defaults to ``"auto"``. On SM12x, ``"auto"`` prefers
         ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
