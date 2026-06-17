@@ -783,7 +783,6 @@ __device__ __forceinline__ void page_produce_kv_sf(
                 sf_ptr[page_head_base + static_cast<size_t>(swz_entry) * sf_stride_n + swz_sd];
           }
         }
-<<<<<<< HEAD
         // NUM_SF_ITERS is rounded up, so the last iter has lanes with
         // flat_byte >= SF_TOTAL_BYTES. Unlike the predicated cp_async store below,
         // this write is unconditional, so guard it on the buffer bound (not in_bounds,
@@ -791,30 +790,19 @@ __device__ __forceinline__ void page_produce_kv_sf(
         if (flat_byte < SF_TOTAL_BYTES) {
           *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
         }
-=======
-        *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
->>>>>>> d4ff3dc1 (feat(attention): NVFP4 KV cache read path for FA2 paged attention (SM120))
       } else {
         const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
         // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV
         // rows including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
         // K SF can use kNoFill since NaN K scores are replaced by -inf via logits_mask before
         // update_mdo_states, so they never reach the accumulator.
-<<<<<<< HEAD
         constexpr auto fill_mode = produce_v ? cp_async::SharedMemFillMode::kFillZero
                                              : cp_async::SharedMemFillMode::kNoFill;
-=======
-        constexpr auto fill_mode =
-            produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
->>>>>>> d4ff3dc1 (feat(attention): NVFP4 KV cache read path for FA2 paged attention (SM120))
         cp_async::pred_load_32b<fill_mode>(
             reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
             reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
       }
-<<<<<<< HEAD
     }
-=======
->>>>>>> d4ff3dc1 (feat(attention): NVFP4 KV cache read path for FA2 paged attention (SM120))
   }
 }
 
