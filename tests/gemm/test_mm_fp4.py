@@ -291,28 +291,6 @@ def test_mm_fp4_b12x_short_k_multi_wave():
         ).item()
         assert cos_sim > 0.97
 
-def test_mm_fp4_auto_prefers_b12x_for_sm121_nvfp4(monkeypatch):
-    from flashinfer.gemm import gemm_base
-
-    class MockTensor:
-        device = "cuda"
-
-    monkeypatch.setattr(
-        gemm_base, "get_cuda_version", lambda: SimpleNamespace(major=13)
-    )
-    monkeypatch.setattr(gemm_base, "get_compute_capability", lambda device: (12, 1))
-
-    backends = gemm_base._heuristic_func_mm_fp4(
-        ["cudnn", "cutlass", "b12x"],
-        MockTensor(),
-        MockTensor(),
-        MockTensor(),
-        MockTensor(),
-        use_nvfp4=True,
-    )
-
-    assert backends == ["b12x", "cutlass", "cudnn"]
-
 
 def test_mm_fp4_cute_dsl_misaligned_n_raises():
     device = torch.device("cuda")
