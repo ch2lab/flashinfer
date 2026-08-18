@@ -650,11 +650,23 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     const int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
     const int64_t kv_len = std::max(int(effective_kv_len_arr[request_idx]), 1);
     const int64_t num_chunks_kv = disable_split_kv ? 1 : ceil_div(kv_len, kv_chunk_size);
+    // NVFP4 (1-byte KV) kernels require each chunk to be at least
+    // min_kv_chunk_size pages to satisfy the NUM_MMA_KV tile-alignment
+    // constraint.  A tail chunk smaller than the minimum would trip the
+    // 1-byte-KV tile floor and cause illegal memory access (Xid 31).
+    // Merge the undersized tail into the previous chunk.
+    int64_t effective_num_chunks = num_chunks_kv;
+    if (kv_dtype_bytes == 1 && num_chunks_kv > 1) {
+      const int64_t last_chunk = kv_len - (num_chunks_kv - 1) * kv_chunk_size;
+      if (last_chunk < min_kv_chunk_size) {
+        effective_num_chunks = num_chunks_kv - 1;
+      }
+    }
     if (fixed_split_size > 0 && !disable_split_kv) {
-      split_kv = split_kv || num_chunks_kv > 1;
+      split_kv = split_kv || effective_num_chunks > 1;
     }
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
-      for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_chunks_kv; ++kv_tile_idx) {
+      for (uint32_t kv_tile_idx = 0; kv_tile_idx < effective_num_chunks; ++kv_tile_idx) {
         new_batch_size += 1;
         request_indices.push_back(request_idx);
         qo_tile_indices.push_back(q_tile_idx);
@@ -664,9 +676,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
 
     int64_t qo_len = packed_qo_len / gqa_group_size;
     for (uint32_t row = 0; row < qo_len; ++row) {
-      merge_indptr.push_back(merge_indptr.back() + num_chunks_kv);
+      merge_indptr.push_back(merge_indptr.back() + effective_num_chunks);
     }
-    o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv);
+    o_indptr.push_back(o_indptr.back() + qo_len * effective_num_chunks);
   }
 
   const size_t padded_batch_size =

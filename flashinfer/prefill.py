@@ -1513,16 +1513,22 @@ def _compute_page_mask_indptr(
 def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
     """Whether split-KV must be disabled because the KV cache is NVFP4.
 
-    Previously this was an *empirical workaround*: with split-KV (flash-decoding)
-    enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
-    a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
-    and prefix-cache extend), while dense full-prefill was unaffected.
+    With split-KV (flash-decoding) enabled, NVFP4 paged KV produces illegal
+    memory access (Xid 31) whenever a short query attends a long KV range
+    (decode and prefix-cache extend). The root cause is in the scheduler's
+    ``PrefillBinarySearchKVChunkSize`` which does not align chunk sizes to
+    the NVFP4 per-16-element block-scale boundary, causing small per-split
+    chunks to trip the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path.
+    FP8 and 16-bit KV caches are unaffected and keep split-KV.
 
-    Currently returning False to re-enable split-KV for NVFP4, which is
-    critical for MTP verification performance on SM120 (short query_len=3
-    attending to long KV sequences needs split-KV parallelism).
+    The decode split-KV is separately controlled by vLLM's ``disable_split_kv``
+    flag (see ``FlashInferMetadataBuilder``); this gate only covers the prefill /
+    ragged prefill path.
     """
-    return False
+    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path convention) (the run path's convention)
+        return True
+    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    return native_fp4 is not None and kv_data_type == native_fp4
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
