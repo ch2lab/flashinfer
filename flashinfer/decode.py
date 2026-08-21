@@ -1213,8 +1213,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,
                 )
             qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
-            # Multi-token requests are causal within each request's block;
-            # DFlash-style non-causal multi-token is not wired up yet.
+            # Multi-token (spec-decode verify) rows are the sequence
+            # continuation: kv_len already includes the query rows' own K/V
+            # (vLLM writes the batch K/V into the cache before attention), so
+            # the prefill-style causal mask col_limit = qo_idx + kv_len -
+            # qo_len makes row j attend history + rows [0, j), matching the
+            # single-token decode convention exactly.
             is_causal = q_len_per_req > 1
             if q_len_per_req > 1:
                 qo_indptr_host = qo_indptr_host * q_len_per_req
@@ -1464,8 +1468,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if q_len_per_req < 1:
             raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
-        # Multi-token requests are causal within each request's block;
-        # DFlash-style non-causal multi-token is not wired up yet.
+        # Multi-token (spec-decode verify) rows are the sequence
+        # continuation: kv_len already includes the query rows' own K/V
+        # (vLLM writes the batch K/V into the cache before attention), so the
+        # prefill-style causal mask makes row j attend history + rows [0, j),
+        # matching the single-token decode convention exactly.
         is_causal = q_len_per_req > 1
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
@@ -2139,11 +2146,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf,
                 out,
                 lse,
-                (
-                    MaskMode.CAUSAL.value
-                    if planned_q_len > 1
-                    else MaskMode.NON_CAUSAL.value
-                ),
+                MaskMode.CAUSAL.value
+                if self._q_len_per_req > 1
+                else MaskMode.NON_CAUSAL.value,
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,

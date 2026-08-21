@@ -1146,9 +1146,13 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
     gqa_group_size,
 ):
     # Spec-decode verify shape: every request carries q_len_per_req tokens.
-    # The tensor-core decode path must produce prefill-wrapper-identical
-    # results eagerly, and stay correct when the plan is refreshed with
-    # different kv lengths between CUDA graph replays.
+    # kv_len covers the history PLUS the query rows' own K/V (vLLM writes
+    # the batch K/V into the cache before attention), so the verify rows
+    # follow the prefill-style causal convention: row j attends
+    # [0, kv_len - q_len_per_req + j]. The tensor-core decode path must
+    # produce prefill-wrapper-identical results eagerly, and stay correct
+    # when the plan is refreshed with different kv lengths between CUDA
+    # graph replays.
     page_size = 16
     head_dim = 128
     dtype = torch.bfloat16
@@ -1200,6 +1204,9 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            # Verify rows are the sequence continuation (their K/V is in the
+            # tail of the kv range), so the reference uses the same
+            # prefill-style causal mask as the decode path.
             causal=True,
             q_data_type=dtype,
             kv_data_type=dtype,
