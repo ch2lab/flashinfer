@@ -9,7 +9,7 @@ from flashinfer.jit.attention.modules import gen_customize_batch_prefill_module
 def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(
     tmp_path, monkeypatch
 ):
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[1]
     monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "generated")
     monkeypatch.setattr(jit_env, "FLASHINFER_CSRC_DIR", repo_root / "csrc")
 
