@@ -161,9 +161,15 @@ def _get_workspace_dir_name() -> pathlib.Path:
 FLASHINFER_WORKSPACE_DIR: pathlib.Path = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "generated"
-FLASHINFER_DATA: pathlib.Path = _package_root / "data"
-FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
-FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
+FLASHINFER_DATA: pathlib.Path = pathlib.Path(
+    os.environ.get("FLASHINFER_DATA_DIR", str(_package_root / "data"))
+)
+FLASHINFER_INCLUDE_DIR: pathlib.Path = pathlib.Path(
+    os.environ.get("FLASHINFER_INCLUDE_DIR", str(FLASHINFER_DATA / "include"))
+)
+FLASHINFER_CSRC_DIR: pathlib.Path = pathlib.Path(
+    os.environ.get("FLASHINFER_CSRC_DIR", str(FLASHINFER_DATA / "csrc"))
+)
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
     _package_root / "data" / "cutlass" / "include",
