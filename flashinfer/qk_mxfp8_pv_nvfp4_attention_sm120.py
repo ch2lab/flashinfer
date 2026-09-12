@@ -211,6 +211,152 @@ def qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv(
     return q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t
 
 
+def nvfp4_side_dequant(
+    side: torch.Tensor,
+    global_scale: float,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Dequantize one NVFP4 KV-cache side to BF16.
+
+    ``side`` is a CUDA uint8 tensor of shape ``(H, S, F)`` with
+    ``F = head_dim / 2 + head_dim / 16``, row layout ``[data | scale]``:
+    row ``(h, s)`` holds the head's ``head_dim / 2`` packed e2m1 data bytes
+    followed by its ``head_dim / 16`` e4m3 group-scale bytes. The caller is
+    responsible for assembling this row-interleaved form: the physical
+    cache side stores one contiguous data region followed by one
+    contiguous scale region, not interleaved rows. Returns ``(H, S,
+    head_dim)`` BF16 where ``head_dim = 2 * (F * 8 // 9)``.
+    ``global_scale`` is the layer's ``_k_scale_float`` / ``_v_scale_float``.
+    """
+    if side.ndim != 3 or not side.is_cuda or side.dtype != torch.uint8:
+        raise ValueError(
+            "side must be a 3D CUDA uint8 tensor (H, S, F), "
+            f"got shape={tuple(side.shape)} dtype={side.dtype}"
+        )
+    if not side.is_contiguous():
+        raise ValueError("side must be contiguous")
+    H, S, F = side.shape
+    head_dim = 2 * (F * 8 // 9)
+    if head_dim // 2 + head_dim // 16 != F:
+        raise ValueError(
+            f"F={F} does not round-trip to a head_dim via "
+            "head_dim = 2 * (F * 8 // 9); supported: 128/256 -> F 80/144"
+        )
+    if out is not None and not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if out is None:
+        out = torch.empty((H, S, head_dim), device=side.device, dtype=torch.bfloat16)
+    get_qk_mxfp8_pv_nvfp4_attention_sm120_module().nvfp4_side_dequant(
+        side, float(global_scale), out
+    )
+    return out
+
+
+def nvfp4_prefill_convert(
+    k_side: torch.Tensor,
+    v_side: torch.Tensor,
+    q_bf16: torch.Tensor,
+    k_scale_global: float,
+    v_scale_global: float,
+    q_scale_global: float,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    r"""Convert NVFP4 KV-cache sides + BF16 query into qk_mxfp8 fwd inputs.
+
+    Dequantizes the NVFP4 cache sides to BF16, applies the FA2-path
+    dequant scale to the query, 128-pads the sequence extents, and runs
+    the MXFP8/NVFP4 quantize ops.
+
+    Args:
+        k_side, v_side: uint8 ``(Hk, S, F)`` contiguous, NVFP4 cache sides
+            (see ``nvfp4_side_dequant``). S may not be a multiple of 128.
+        q_bf16: BF16 ``(1, Hq, M, D)`` (or ``(Hq, M, D)``, batch added).
+        *_scale_global: the layer's ``_q_scale_float`` / ``_k_scale_float`` /
+            ``_v_scale_float`` (FA2-path dequant semantics).
+
+    Returns:
+        ``(q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t)`` with 128-padded
+        M/N physical extents — feed straight into
+        ``qk_mxfp8_pv_nvfp4_attention_sm120_fwd`` together with
+        ``unpadded_q_len`` / ``unpadded_k_len``.
+    """
+    for name, t in (("k_side", k_side), ("v_side", v_side)):
+        _check_cuda_contiguous(name, t)
+    if k_side.shape != v_side.shape:
+        raise ValueError(
+            "k_side and v_side must have the same shape, "
+            f"got {tuple(k_side.shape)} vs {tuple(v_side.shape)}"
+        )
+    Hk, S, F = k_side.shape
+    D = 2 * (F * 8 // 9)
+    if S <= 0:
+        raise ValueError(
+            f"cache side sequence length must be positive, got {S}"
+        )
+    _check_cuda_contiguous("q_bf16", q_bf16)
+    if q_bf16.dtype not in _SUPPORTED_QKV_DTYPES:
+        raise ValueError(
+            "q_bf16 must have dtype torch.float16 or torch.bfloat16, "
+            f"got {q_bf16.dtype}"
+        )
+    if q_bf16.ndim == 3:
+        q_bf16 = q_bf16.unsqueeze(0)
+    if q_bf16.ndim != 4:
+        raise ValueError(
+            "q_bf16 must have shape (1, Hq, M, D) or (Hq, M, D), "
+            f"got shape={tuple(q_bf16.shape)}"
+        )
+    if q_bf16.shape[0] != 1 or q_bf16.shape[3] != D:
+        raise ValueError(
+            f"q_bf16 must have batch 1 and head_dim {D}, "
+            f"got {tuple(q_bf16.shape)}"
+        )
+    Hq, M = q_bf16.shape[1], q_bf16.shape[2]
+    if M <= 0:
+        raise ValueError(f"q_bf16 sequence length must be positive, got {M}")
+    if Hq < Hk or Hq % Hk != 0:
+        raise ValueError(f"Hq={Hq} must be a multiple of Hk={Hk}")
+    _check_same_device("q_bf16", q_bf16, "k_side", k_side)
+
+    module = get_qk_mxfp8_pv_nvfp4_attention_sm120_module()
+    k_bf16 = nvfp4_side_dequant(k_side, k_scale_global).unsqueeze(0)
+    v_bf16 = nvfp4_side_dequant(v_side, v_scale_global).unsqueeze(0)
+    q_in = (q_bf16.float() * q_scale_global).to(q_bf16.dtype)
+    k_pad = _pad_seq_len_to_128(k_bf16)
+    v_pad = _pad_seq_len_to_128(v_bf16)
+    q_pad = _pad_seq_len_to_128(q_in)
+
+    M_pad, N_pad = q_pad.shape[2], k_pad.shape[2]
+    q_fp8 = torch.empty(
+        (1, Hq, M_pad, D), device=q_bf16.device, dtype=torch.float8_e4m3fn
+    )
+    q_scale = torch.empty(
+        (1, Hq, M_pad, D // 32), device=q_bf16.device, dtype=torch.uint8
+    )
+    k_fp8 = torch.empty(
+        (1, Hk, N_pad, D), device=q_bf16.device, dtype=torch.float8_e4m3fn
+    )
+    k_scale = torch.empty(
+        (1, Hk, N_pad, D // 32), device=q_bf16.device, dtype=torch.uint8
+    )
+    v_fp4_t = torch.empty(
+        (1, Hk, D, N_pad // 2), device=q_bf16.device, dtype=torch.uint8
+    )
+    v_scale_t = torch.empty(
+        (1, Hk, D, N_pad // 16), device=q_bf16.device, dtype=torch.float8_e4m3fn
+    )
+    module.scaled_fp8_quant(q_pad, q_fp8, q_scale, _HND_LAYOUT)
+    module.scaled_fp8_quant_permute(k_pad, k_fp8, k_scale, _HND_LAYOUT)
+    module.scaled_fp4_quant_trans(v_pad, v_fp4_t, v_scale_t, _HND_LAYOUT)
+    return q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t
+
+
 def _check_inputs(
     q_fp8: torch.Tensor,
     k_fp8: torch.Tensor,

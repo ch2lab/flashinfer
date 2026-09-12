@@ -19,6 +19,10 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
+from flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120 import (
+    nvfp4_prefill_convert,
+    nvfp4_side_dequant,
+)
 from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
 
 
@@ -172,6 +176,7 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_accuracy(
         pytest.param(4, 4, 128, 128, False, id="d256-mha-noncausal"),
         pytest.param(4, 4, 256, 256, True, id="d256-mha-causal"),
         pytest.param(8, 2, 256, 256, False, id="d256-gqa-noncausal"),
+        pytest.param(8, 2, 256, 317, True, id="d256-gqa-causal-longkv"),
     ],
 )
 @torch.inference_mode()
@@ -541,3 +546,242 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_rejects_invalid_inputs():
             *quantized,
             lse=torch.empty((1, 4, 128), device="cuda", dtype=torch.float32),
         )
+
+
+def test_nvfp4_side_dequant_d256():
+    """Dequant of a hand-crafted NVFP4 side matches the documented layout bit-exactly."""
+    _require_sm120()
+    torch.manual_seed(0)
+    H, S, D = 2, 130, 256  # S not a multiple of 128 (stride-bug probe)
+    F = D // 2 + D // 16  # 144
+    global_scale = 1.7
+    # Arbitrary fp4 nibble bytes (all nibbles are valid e2m1) + finite e4m3 scale
+    # bytes (0x7F is the e4m3fn NaN code, remap it so the scales stay finite).
+    sf = torch.randint(0, 255, (H, S, D // 16), dtype=torch.uint8, device="cuda")
+    sf[sf == 0x7F] = 0
+    data = torch.randint(0, 256, (H, S, D // 2), dtype=torch.uint8, device="cuda")
+    side = torch.cat([data, sf.view(torch.uint8)], dim=-1).contiguous()
+    out = nvfp4_side_dequant(side, global_scale)
+    assert out.shape == (H, S, D) and out.dtype == torch.bfloat16
+    # dim 2b = low nibble of data byte b, dim 2b+1 = high nibble; group g's scale
+    # multiplies dims [16g, 16g+16).
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=data.device,
+    )
+    lo = (data & 0x0F).long()
+    hi = ((data >> 4) & 0x0F).long()
+    per_dim = torch.stack([lut[lo], lut[hi]], dim=-1).reshape(H, S, D)
+    sfv = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+    ref = (per_dim * sfv * float(global_scale)).to(torch.bfloat16)
+    assert torch.equal(out, ref)
+
+
+def test_nvfp4_side_dequant_d128():
+    """Dequant of a hand-crafted NVFP4 side (D128) matches the documented layout bit-exactly."""
+    _require_sm120()
+    torch.manual_seed(0)
+    H, S, D = 4, 64, 128
+    F = D // 2 + D // 16  # 72
+    global_scale = 1.7
+    # Arbitrary fp4 nibble bytes (all nibbles are valid e2m1) + finite e4m3 scale
+    # bytes (0x7F is the e4m3fn NaN code, remap it so the scales stay finite).
+    sf = torch.randint(0, 255, (H, S, D // 16), dtype=torch.uint8, device="cuda")
+    sf[sf == 0x7F] = 0
+    data = torch.randint(0, 256, (H, S, D // 2), dtype=torch.uint8, device="cuda")
+    side = torch.cat([data, sf.view(torch.uint8)], dim=-1).contiguous()
+    out = nvfp4_side_dequant(side, global_scale)
+    assert out.shape == (H, S, D) and out.dtype == torch.bfloat16
+    # dim 2b = low nibble of data byte b, dim 2b+1 = high nibble; group g's scale
+    # multiplies dims [16g, 16g+16).
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=data.device,
+    )
+    lo = (data & 0x0F).long()
+    hi = ((data >> 4) & 0x0F).long()
+    per_dim = torch.stack([lut[lo], lut[hi]], dim=-1).reshape(H, S, D)
+    sfv = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+    ref = (per_dim * sfv * float(global_scale)).to(torch.bfloat16)
+    assert torch.equal(out, ref)
+
+
+def _quantize_to_fp4_bytes(x, sf_bytes):
+    """Round BF16 ``x`` (1, H, S, D) to packed NVFP4 data bytes.
+
+    ``sf_bytes`` is ``(H, S, D // 16)`` uint8 holding one e4m3 group scale per
+    16 dims. Returns ``(H, S, D // 2)`` uint8 where dim 2b is the low
+    nibble and dim 2b+1 the high nibble of data byte b, on the e2m1 grid.
+    """
+    H, S, D = x.shape[1], x.shape[2], x.shape[3]
+    sf = sf_bytes.view(torch.float8_e4m3fn).float().reshape(H, S, D // 16, 1)
+    y = x.float().reshape(1, H, S, D // 16, 16) / sf
+    bounds = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    idx = torch.bucketize(y.abs(), bounds)
+    nibble = idx + ((y < 0).to(idx.dtype) * 8)
+    byte = nibble[..., 0::2] + (nibble[..., 1::2] << 4)
+    return byte.reshape(H, S, D // 2).to(torch.uint8)
+
+
+def _torch_dequant_side(side):
+    """Dequant an NVFP4 cache side (H, S, F) uint8 to float32 (H, S, D)."""
+    H, S, F = side.shape
+    D = 2 * (F * 8 // 9)
+    data = side[..., : D // 2]
+    sf = side[..., D // 2 :]
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=side.device,
+    )
+    lo = (data & 0x0F).long()
+    hi = ((data >> 4) & 0x0F).long()
+    per_dim = torch.stack([lut[lo], lut[hi]], dim=-1).reshape(H, S, D)
+    sfv = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+    return per_dim * sfv
+
+
+def _ref_attention(q, k, v, num_qo_heads, num_kv_heads, causal, sm_scale):
+    """Exact float32 GQA attention over (Hq, M, D) q and (Hk, N, D) k/v."""
+    if num_qo_heads != num_kv_heads:
+        group = num_qo_heads // num_kv_heads
+        k = k.repeat_interleave(group, dim=0)
+        v = v.repeat_interleave(group, dim=0)
+    scores = q @ k.transpose(-2, -1) * sm_scale
+    if causal:
+        qo_len, kv_len = q.shape[1], k.shape[1]
+        qo_idx = torch.arange(qo_len, device=q.device)[:, None]
+        kv_idx = torch.arange(kv_len, device=q.device)[None, :]
+        valid = kv_idx <= qo_idx + kv_len - qo_len
+        scores = scores.masked_fill(~valid, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        out = probs @ v
+        # Fully-masked rows (the kv_len < qo_len prefix) have no valid keys;
+        # the kernel emits zeros there.
+        return torch.where(valid.any(dim=-1).unsqueeze(0).unsqueeze(-1), out, 0.0)
+    return torch.softmax(scores, dim=-1) @ v
+
+
+def _cosine(a, b):
+    return (a @ b) / (a.norm() * b.norm())
+
+
+@torch.inference_mode()
+def test_nvfp4_prefill_convert_matches_exact_attention():
+    """Convert NVFP4 cache sides + BF16 q, run fwd; compare vs exact
+    attention computed from the same dequantized BF16 K/V (GQA 12/2, D256,
+    causal, variable lengths not 128-aligned). Tolerances match the T4
+    precision-gate regime (mxfp8/fp4 requant rounding is the only diff)."""
+    _require_sm120()
+    torch.manual_seed(1)
+    Hq, Hk, D, M, N = 12, 2, 256, 300, 131
+    q = torch.randn(1, Hq, M, D, device="cuda", dtype=torch.bfloat16)
+    k_bf16 = torch.randn(1, Hk, N, D, device="cuda", dtype=torch.bfloat16)
+    v_bf16 = torch.randn(1, Hk, N, D, device="cuda", dtype=torch.bfloat16)
+    # Build a valid NVFP4 cache side from the same bf16 (quantize in torch:
+    # per-group e4m3 scale + e2m1 rounding), so the reference attention and
+    # the kernel see identical pre-quantization values.
+    def make_side(x, sf_bytes):
+        data = _quantize_to_fp4_bytes(x, sf_bytes)
+        return torch.cat([data, sf_bytes], dim=-1).contiguous()
+
+    def group_scales(x):
+        # Per-16-dim e4m3 scale bytes: group max / 6.0 keeps every |dim/scale|
+        # <= 6, the e2m1 range. 0x7F/0xFF are the e4m3fn NaN bytes.
+        amax = x.float().abs().reshape(*x.shape[1:-1], x.shape[-1] // 16, 16)
+        amax = amax.amax(dim=-1)
+        sf = (amax / 6.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        sf[(sf == 0x7F) | (sf == 0xFF)] = 0
+        return sf.reshape(x.shape[1:-1] + (x.shape[-1] // 16,))
+
+    k_side = make_side(k_bf16, group_scales(k_bf16))
+    v_side = make_side(v_bf16, group_scales(v_bf16))
+
+    q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t = nvfp4_prefill_convert(
+        k_side, v_side, q[0], 1.0, 1.0, 1.0
+    )
+    out = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
+        q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t,
+        sm_scale=D ** -0.5, causal=True,
+        unpadded_q_len=M, unpadded_k_len=N,
+    )
+    # Reference: exact attention on the SAME bf16 (dequant of the crafted side)
+    k_ref = _torch_dequant_side(k_side)      # (Hk, N, D) float32
+    v_ref = _torch_dequant_side(v_side)
+    out_ref = _ref_attention(
+        q[0].float(), k_ref, v_ref, Hq, Hk, True, D ** -0.5
+    )
+    cos = _cosine(out[0, :, :M, :].float().flatten(), out_ref[:, :M, :].flatten())
+    rel = (out[0, :, :M, :].float() - out_ref[:, :M, :]).norm() / \
+          out_ref[:, :M, :].norm()
+    assert cos >= 0.99, f"cos={cos:.4f}"
+    assert rel.item() <= 0.2, f"rel={rel.item():.4f}"
+
+
+@torch.inference_mode()
+def test_nvfp4_prefill_convert_kv_longer_scales():
+    """Convert NVFP4 cache sides + BF16 q in the chunked-prefill regime (KV
+    history N > Q chunk M, causal) with non-unity global scales; compare vs
+    exact attention on the SAME effective values the kernel sees — dequant K
+    x k_scale, dequant V x v_scale, q x q_scale (nvfp4_side_dequant applies the
+    global scale; nvfp4_prefill_convert does not center K, so neither does this
+    reference). Tolerances match the sibling convert test."""
+    _require_sm120()
+    torch.manual_seed(1)
+    Hq, Hk, D, M, N = 12, 2, 256, 256, 2048
+    q_scale, k_scale, v_scale = 1.0, 2.5, 0.75
+    q = torch.randn(1, Hq, M, D, device="cuda", dtype=torch.bfloat16)
+    k_bf16 = torch.randn(1, Hk, N, D, device="cuda", dtype=torch.bfloat16)
+    v_bf16 = torch.randn(1, Hk, N, D, device="cuda", dtype=torch.bfloat16)
+    # Build a valid NVFP4 cache side from the same bf16 (per-group e4m3 scale +
+    # e2m1 rounding), so the reference and the kernel share pre-quant values.
+    def make_side(x, sf_bytes):
+        data = _quantize_to_fp4_bytes(x, sf_bytes)
+        return torch.cat([data, sf_bytes], dim=-1).contiguous()
+
+    def group_scales(x):
+        # Per-16-dim e4m3 scale bytes: group max / 6.0 keeps every |dim/scale|
+        # <= 6, the e2m1 range. 0x7F/0xFF are the e4m3fn NaN bytes.
+        amax = x.float().abs().reshape(*x.shape[1:-1], x.shape[-1] // 16, 16)
+        amax = amax.amax(dim=-1)
+        sf = (amax / 6.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        sf[(sf == 0x7F) | (sf == 0xFF)] = 0
+        return sf.reshape(x.shape[1:-1] + (x.shape[-1] // 16,))
+
+    k_side = make_side(k_bf16, group_scales(k_bf16))
+    v_side = make_side(v_bf16, group_scales(v_bf16))
+
+    q_fp8, k_fp8, v_fp4_t, q_scale_t, k_scale_t, v_scale_t = (
+        nvfp4_prefill_convert(
+            k_side,
+            v_side,
+            q[0],
+            k_scale_global=k_scale,
+            v_scale_global=v_scale,
+            q_scale_global=q_scale,
+        )
+    )
+    out = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
+        q_fp8, k_fp8, v_fp4_t, q_scale_t, k_scale_t, v_scale_t,
+        sm_scale=D ** -0.5, causal=True,
+        unpadded_q_len=M, unpadded_k_len=N,
+    )
+    # Reference: exact attention on the SAME effective values the kernel sees.
+    # nvfp4_side_dequant multiplies the raw dequant by the global scale, so
+    # k_eff = dequant(K) x k_scale, v_eff = dequant(V) x v_scale; q_eff = q x
+    # q_scale (1.0, a no-op). _torch_dequant_side is the raw float32 dequant.
+    q_ref = q[0].float() * q_scale                      # (Hq, M, D) float32
+    k_ref = _torch_dequant_side(k_side) * k_scale       # (Hk, N, D) float32
+    v_ref = _torch_dequant_side(v_side) * v_scale       # (Hk, N, D) float32
+    out_ref = _ref_attention(q_ref, k_ref, v_ref, Hq, Hk, True, D ** -0.5)
+    cos = _cosine(out[0, :, :M, :].float().flatten(), out_ref[:, :M, :].flatten())
+    rel = (out[0, :, :M, :].float() - out_ref[:, :M, :]).norm() / \
+          out_ref[:, :M, :].norm()
+    assert cos >= 0.99, f"cos={cos:.4f}"
+    assert rel.item() <= 0.2, f"rel={rel.item():.4f}"

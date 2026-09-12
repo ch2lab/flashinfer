@@ -807,3 +807,78 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(scaled_fp8_quant,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     scaled_fp8_quant_permute,
     flashinfer::qk_mxfp8_pv_nvfp4_attention_sm120::scaled_fp8_quant_permute);
+
+// ---- NVFP4 cache-side dequant (SM120 service integration) -----------------
+// One thread decodes one 16-dim scale group: 8 data bytes + 1 e4m3 scale byte
+// -> 16 BF16 values. Side layout per (head, seq) row: [data(D/2) | sf(D/16)],
+// linear, matching the SM120 KV-cache writer (vllm
+// csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu). Each data byte holds two
+// fp4 nibbles: dim 2b = low nibble, dim 2b+1 = high nibble. e2m1 decode table:
+// {0,.5,1,1.5,2,3,4,6} with sign bit 3.
+namespace {
+__device__ const float kE2M1_LUT[16] = {
+    0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+    -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__global__ void nvfp4_side_dequant_kernel(const uint8_t* __restrict__ side, float global_scale,
+                                          __nv_bfloat16* __restrict__ out, int num_tokens,
+                                          int scale_dim, int full_dim, int head_dim) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_tokens * scale_dim) return;  // one thread per 16-dim scale group
+  const int head = blockIdx.z;
+  const int s = tid / scale_dim;  // token within (head, s)
+  const int g = tid % scale_dim;  // scale group (16 dims)
+
+  const int64_t row = static_cast<int64_t>(head * num_tokens + s) * full_dim;
+  const uint8_t* side_row = side + row;
+  const float sf =
+      float(reinterpret_cast<const __nv_fp8_e4m3&>(side_row[full_dim - scale_dim + g]));
+  const uint8_t* db = side_row + g * 8;  // 16 fp4 nibbles = 8 bytes
+
+  const int64_t out_row = static_cast<int64_t>(head * num_tokens + s) * head_dim + g * 16;
+  auto* ob = reinterpret_cast<__nv_bfloat162*>(out + out_row);
+#pragma unroll
+  for (int b = 0; b < 8; ++b) {
+    const float lo = kE2M1_LUT[db[b] & 0x0F] * sf * global_scale;
+    const float hi = kE2M1_LUT[(db[b] >> 4) & 0x0F] * sf * global_scale;
+    ob[b] = __floats2bfloat162_rn(lo, hi);
+  }
+}
+}  // namespace
+
+namespace flashinfer {
+namespace qk_mxfp8_pv_nvfp4_attention_sm120 {
+
+void nvfp4_side_dequant(TensorView side, float global_scale, TensorView out) {
+  CHECK_QUANT_CUDA(side);
+  CHECK_QUANT_CUDA(out);
+  CHECK_QUANT_LASTDIM_CONTIGUOUS(side);
+  CHECK_QUANT_LASTDIM_CONTIGUOUS(out);
+  CHECK_QUANT_DTYPE(side, dl_uint8);
+  CHECK_QUANT_DTYPE(out, dl_bfloat16);
+  CHECK_QUANT_DIMS(side, 3);
+  CHECK_QUANT_DIMS(out, 3);
+
+  const int64_t H = side.size(0);
+  const int64_t S = side.size(1);
+  const int64_t F = side.size(2);
+  const int64_t D = out.size(2);
+  TVM_FFI_ICHECK(out.size(0) == H && out.size(1) == S)
+      << "out must have shape (H, S, D), got H=" << H << " S=" << S;
+  TVM_FFI_ICHECK(F == D / 2 + D / 16)
+      << "side last dim F=" << F << " must equal D/2 + D/16 for D=" << D;
+
+  const int scale_dim = static_cast<int>(D / 16);
+  const int total_groups = static_cast<int>(S * scale_dim);
+  const dim3 grid((total_groups + 255) / 256, 1, H);
+  nvfp4_side_dequant_kernel<<<grid, 256, 0, get_stream(side.device())>>>(
+      reinterpret_cast<const uint8_t*>(side.data_ptr()), global_scale,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), static_cast<int>(S), scale_dim,
+      static_cast<int>(F), static_cast<int>(D));
+}
+
+}  // namespace qk_mxfp8_pv_nvfp4_attention_sm120
+}  // namespace flashinfer
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_side_dequant,
+                              flashinfer::qk_mxfp8_pv_nvfp4_attention_sm120::nvfp4_side_dequant);
