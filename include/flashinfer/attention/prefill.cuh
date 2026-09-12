@@ -4825,6 +4825,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
         }
+        if constexpr (KTraits::USE_WMMA_LOAD) {
+          // sm_70: s_frag from the wmma m16n16 mma is in the wmma C fragment layout; permute it
+          // to the PTX m16n8x2 s_frag layout the logits/mask/mdo/pv/store expect, via a per-warp
+          // 16x16 smem scratch (see permute_s_frag_wmma_to_ptx).
+          for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+            for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv) {
+              permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, s_frag[mq][mkv],
+                                                  smem_storage.s_perm_ptr(warp_idx));
+            }
+          }
+        }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                   kv_head_idx);
@@ -4867,6 +4878,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                            get_warp_idx_kv<KTraits>(tid.z),
                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
         } else {
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: o_frag is the wmma m16n16 C accumulator (PV mma). Bring it to the PTX m16n8x2
+            // layout so update_mdo_states can rescale it per PTX row (the wmma C rows a thread
+            // holds do NOT align with the PTX j-group o_scale). Converted back to wmma C before the
+            // PV mma in compute_sfm_v.
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t dv = 0; dv < O_FRAG_D; ++dv) {
+                permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, o_frag[mq][dv],
+                                                    smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+          }
           update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         }
 
@@ -4909,11 +4932,27 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_VO),
               lane_idx, s_frag, o_frag, d, d_base);
         } else {
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: o_frag was permuted to PTX before update_mdo_states (for the per-PTX-row
+            // rescale). Convert it back to the wmma m16n16 C layout so the PV mma in compute_sfm_v
+            // can accumulate into it.
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t dv = 0; dv < O_FRAG_D; ++dv) {
+                permute_frag_ptx_to_wmma_c<float>(lane_idx, o_frag[mq][dv],
+                                                  smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+          }
           compute_sfm_v<KTraits>(
               &v_smem, &v_smem_offset_r,
               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_VO),
-              lane_idx, s_frag, o_frag, d, d_base);
+              lane_idx, s_frag, o_frag, d, d_base,
+              // sm_70: pass the (kLinear/plain) V buffer + the per-warp C-permutation (float) and
+              // P-staging (half) scratch. On sm_80+ these extra args are unused (USE_WMMA_LOAD
+              // false) and the perm ptrs are nullptr there.
+              &v_smem, smem_storage.s_perm_ptr(warp_idx), warp_idx,
+              smem_storage.p_perm_ptr(warp_idx));
         }
 
         block.sync();
@@ -4938,6 +4977,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
       cp_async::wait_group<0>();
       block.sync();
+
+      if constexpr (KTraits::USE_WMMA_LOAD) {
+        // sm_70 kLinear: o_frag has accumulated in the wmma m16n16 C layout through the whole KV
+        // loop (PV mma accumulator). Now permute it once to the PTX m16n8x2 layout that
+        // threadblock_sync_mdo_states / transform_output / write_o expect.
+        for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+          for (uint32_t dv = 0; dv < O_FRAG_D; ++dv) {
+            permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, o_frag[mq][dv],
+                                                smem_storage.s_perm_ptr(warp_idx));
+          }
+        }
+      }
 
       finalize_m<KTraits>(variant, m);
 
