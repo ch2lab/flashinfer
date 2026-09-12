@@ -53,15 +53,35 @@ if not jit_spec_registry.get_all_statuses():
 all_specs = list(jit_spec_registry.get_all_specs().values())
 
 
-def _targets_sm70(s):
-    ec = getattr(s, "extra_cuda_cflags", None)
-    # None/空 = 用默认 arch(当前 = 7.0);否则必须显式含 sm_70
-    if not ec:
-        return True
-    return any(TARGET in (f or "") for f in ec)
+# 关键:16-bit 分页 attention(decode + prefill)模块不写显式 -gencode(走默认
+# arch)。本构建 FLASHINFER_CUDA_ARCH_LIST=7.0,默认 arch 即 sm_70,因此它们实际
+# 会被编成 sm_70 —— 但旧启发式只看 stored flags 里是否含 "sm_70" 字样,导致 0 命中。
+# 这里按 模块名 + 16-bit KV 类型 + head_dim 精确挑选目标模块,既保证编到 16-bit
+# 分页 decode/prefill,又避免把 sm90/smel120 专用 kernel(编不了 sm_70)也拉进来。
+def _is_16bit_paged_target(s):
+    n = s.name
+    if not (
+        n.startswith("batch_decode_with_kv_cache")
+        or n.startswith("batch_prefill_with_kv_cache")
+    ):
+        return False
+    # 只要 16-bit KV(bf16/f16);排除 fp8(e4m3/e5m2)与 nvfp4/fp4
+    if (
+        "_dtype_kv_e4m3" in n
+        or "_dtype_kv_e5m2" in n
+        or "_dtype_kv_fp4" in n
+        or "_dtype_kv_nvfp4" in n
+    ):
+        return False
+    if "_dtype_kv_bf16" not in n and "_dtype_kv_f16" not in n:
+        return False
+    # head_dim_qk=128(模型配置);64/256 走同一 kernel 路径,需要时放开此过滤
+    if "_head_dim_qk_128_" not in n:
+        return False
+    return True
 
 
-specs = [s for s in all_specs if _targets_sm70(s)]
+specs = [s for s in all_specs if _is_16bit_paged_target(s)]
 st0 = jit_spec_registry.get_stats()
 print(f"=== SM70 目标模块: {len(specs)} / 共 {st0['total']} ===")
 

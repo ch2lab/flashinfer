@@ -5152,6 +5152,22 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
                                                  typename KTraits::SharedStoragePaged,
                                                  typename KTraits::SharedStorage>;
           size_t smem_size = sizeof(SmemStorage);
+          // sm_70: de-swizzle scratch (s_perm_smem float + p_perm_smem half) is
+          // __CUDA_ARCH__-gated to 700<=arch<750, so the host sizeof excludes it; add its
+          // size when running on sm_70 or the kernel writes past the allocated dynamic smem.
+          {
+            int cc_major = 0, cc_minor = 0;
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_major,
+                                                       cudaDevAttrComputeCapabilityMajor, dev_id));
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_minor,
+                                                       cudaDevAttrComputeCapabilityMinor, dev_id));
+            if (cc_major == 7 && cc_minor == 0) {
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(float);
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(half);
+            }
+          }
           auto kernel = BatchPrefillWithRaggedKVCacheKernel<KTraits, Params>;
           // Exact final check: the analytic NUM_MMA_KV budget can slightly
           // under-count the real struct (cross-warp merge buffers, padding);
@@ -5361,6 +5377,23 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
           FLASHINFER_ERROR(err_msg.str());
         } else {
           size_t smem_size = sizeof(typename KTraits::SharedStoragePaged);
+          // sm_70: the de-swizzle scratch buffers (s_perm_smem float + p_perm_smem half) are
+          // __CUDA_ARCH__-gated to 700<=arch<750, so the host sizeof excludes them; add their
+          // size when running on sm_70, else the kernel writes past the allocated dynamic smem
+          // (out-of-bounds __shared__ write on the V100).
+          {
+            int cc_major = 0, cc_minor = 0;
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_major,
+                                                       cudaDevAttrComputeCapabilityMajor, dev_id));
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_minor,
+                                                       cudaDevAttrComputeCapabilityMinor, dev_id));
+            if (cc_major == 7 && cc_minor == 0) {
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(float);
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(half);
+            }
+          }
           auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
           // Exact final check: the analytic NUM_MMA_KV budget can slightly
           // under-count the real struct (cross-warp merge buffers, padding);
