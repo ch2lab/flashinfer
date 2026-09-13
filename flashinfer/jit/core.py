@@ -105,13 +105,17 @@ logger = FlashInferJITLogger("flashinfer.jit")
 
 
 def check_cuda_arch():
+    # Opt-in Volta support (decode-only subset initially; prefill kernels
+    # still require SM75+/SM80+ instructions unless built with the SM70
+    # WMMA overlay).
+    allow_sm70 = os.environ.get("FLASHINFER_ALLOW_SM70", "0") == "1"
     # Collect all detected CUDA architectures
     eligible = False
     for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
         if major >= 8:
             eligible = True
         elif major == 7 and minor.isdigit():
-            if int(minor) >= 5:
+            if int(minor) >= 5 or (allow_sm70 and int(minor) >= 0):
                 eligible = True
 
     # Raise error only if all detected architectures are lower than sm75

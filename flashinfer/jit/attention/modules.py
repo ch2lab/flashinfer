@@ -1269,8 +1269,10 @@ def _fa2_head_dim_nvcc_flags(
                 return current_compilation_context.get_nvcc_flags_list(
                     supported_major_versions=[10, 11, 12]
                 )
+        # SM70 (Volta) is included so the 16-bit FA2 path can emit sm_70
+        # gencode when FLASHINFER_ALLOW_SM70=1 and the arch list targets 7.0.
         return current_compilation_context.get_nvcc_flags_list(
-            supported_major_versions=[8, 9, 10, 11, 12]
+            supported_major_versions=[7, 8, 9, 10, 11, 12]
         )
     return None
 

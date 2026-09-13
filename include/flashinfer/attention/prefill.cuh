@@ -237,6 +237,205 @@ struct VOSplitSmem<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_VO, DTypeQ, k
   alignas(16) float2 vosplit_md_smem[NUM_WARPS_KV * CTA_TILE_Q];
 };
 
+// sm_70 (no ldmatrix): de-swizzle a 128B-swizzled row-major smem tile into a plain
+// row-major buffer so wmma::load_matrix_sync can read it. swizzled[row*stride_b128 + c_b128]
+// holds the logical (row, c_b128) value; plain layout is plain[row*stride_b128 + c_b128] =
+// swizzled[row*stride_b128 + (c_b128 ^ (row % 8))]. Operates at 128b granularity.
+template <typename T, uint32_t STRIDE_B128, uint32_t NUM_ROWS>
+__device__ __forceinline__ void deswizzle_tile_128b(T* __restrict__ plain, const T* __restrict__ swz,
+                                                     uint32_t num_threads) {
+  constexpr uint32_t NUM_B128 = NUM_ROWS * STRIDE_B128;
+  uint4* p = reinterpret_cast<uint4*>(plain);
+  const uint4* s = reinterpret_cast<const uint4*>(swz);
+  // full-block linear thread id (threadIdx.x alone covers only one warp -> would leave most
+  // b128 unwritten -> garbage -> NaN). num_threads = total block threads.
+  uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+  for (uint32_t idx = tid; idx < NUM_B128; idx += num_threads) {
+    uint32_t r = idx / STRIDE_B128, c = idx % STRIDE_B128;
+    p[idx] = s[r * STRIDE_B128 + (c ^ (r % 8))];
+  }
+}
+
+// Convert a 128B-swizzled b128 sub-tile base offset into its plain row-major equivalent
+// (undoes the per-row (c ^ (row%8)) b128 swizzle). Used so wmma::load_matrix_sync can read
+// a de-swizzled plain buffer at the logically-correct sub-tile base.
+template <uint32_t UP>
+__device__ __forceinline__ uint32_t swz_to_plain_off(uint32_t swz_off) {
+  uint32_t r = swz_off / UP, c = swz_off % UP;
+  return r * UP + (c ^ (r % 8));
+}
+
+// sm_70: wmma m16n16k16 C fragment (t,r) -> (row,col) table (measured unambiguously on
+// V100 via /tmp/vllm_runs/wmma_rc2.cu store_matrix_sync tag method + mma cross-check; the
+// earlier wmma_rc.cu prime-product measurement was flawed: C=16*P[m]*P[n] is symmetric
+// under (m,n)<->(n,m) so all row>col entries were misreported as (col,row)). 32 threads x
+// 8 regs, a valid permutation of 0-255. Used to permute the wmma C result (QK s_frag / PV
+// o_frag) into the PTX m16n8x2 s_frag layout the prefill mdo/pv/store expect.
+__device__ __forceinline__ uint32_t wmma_c_rc(uint32_t lane, uint32_t reg) {
+  // T[lane][reg] = row*16+col for the wmma m16n16 C fragment (lane 0-31, reg 0-7).
+  static constexpr uint32_t T[32][8] = {
+      {0 * 16 + 0, 0 * 16 + 1, 2 * 16 + 0, 2 * 16 + 1, 0 * 16 + 4, 0 * 16 + 5, 2 * 16 + 4, 2 * 16 + 5},
+      {1 * 16 + 0, 1 * 16 + 1, 3 * 16 + 0, 3 * 16 + 1, 1 * 16 + 4, 1 * 16 + 5, 3 * 16 + 4, 3 * 16 + 5},
+      {0 * 16 + 2, 0 * 16 + 3, 2 * 16 + 2, 2 * 16 + 3, 0 * 16 + 6, 0 * 16 + 7, 2 * 16 + 6, 2 * 16 + 7},
+      {1 * 16 + 2, 1 * 16 + 3, 3 * 16 + 2, 3 * 16 + 3, 1 * 16 + 6, 1 * 16 + 7, 3 * 16 + 6, 3 * 16 + 7},
+      {8 * 16 + 0, 8 * 16 + 1, 10 * 16 + 0, 10 * 16 + 1, 8 * 16 + 4, 8 * 16 + 5, 10 * 16 + 4, 10 * 16 + 5},
+      {9 * 16 + 0, 9 * 16 + 1, 11 * 16 + 0, 11 * 16 + 1, 9 * 16 + 4, 9 * 16 + 5, 11 * 16 + 4, 11 * 16 + 5},
+      {8 * 16 + 2, 8 * 16 + 3, 10 * 16 + 2, 10 * 16 + 3, 8 * 16 + 6, 8 * 16 + 7, 10 * 16 + 6, 10 * 16 + 7},
+      {9 * 16 + 2, 9 * 16 + 3, 11 * 16 + 2, 11 * 16 + 3, 9 * 16 + 6, 9 * 16 + 7, 11 * 16 + 6, 11 * 16 + 7},
+      {0 * 16 + 8, 0 * 16 + 9, 2 * 16 + 8, 2 * 16 + 9, 0 * 16 + 12, 0 * 16 + 13, 2 * 16 + 12, 2 * 16 + 13},
+      {1 * 16 + 8, 1 * 16 + 9, 3 * 16 + 8, 3 * 16 + 9, 1 * 16 + 12, 1 * 16 + 13, 3 * 16 + 12, 3 * 16 + 13},
+      {0 * 16 + 10, 0 * 16 + 11, 2 * 16 + 10, 2 * 16 + 11, 0 * 16 + 14, 0 * 16 + 15, 2 * 16 + 14, 2 * 16 + 15},
+      {1 * 16 + 10, 1 * 16 + 11, 3 * 16 + 10, 3 * 16 + 11, 1 * 16 + 14, 1 * 16 + 15, 3 * 16 + 14, 3 * 16 + 15},
+      {8 * 16 + 8, 8 * 16 + 9, 10 * 16 + 8, 10 * 16 + 9, 8 * 16 + 12, 8 * 16 + 13, 10 * 16 + 12, 10 * 16 + 13},
+      {9 * 16 + 8, 9 * 16 + 9, 11 * 16 + 8, 11 * 16 + 9, 9 * 16 + 12, 9 * 16 + 13, 11 * 16 + 12, 11 * 16 + 13},
+      {8 * 16 + 10, 8 * 16 + 11, 10 * 16 + 10, 10 * 16 + 11, 8 * 16 + 14, 8 * 16 + 15, 10 * 16 + 14, 10 * 16 + 15},
+      {9 * 16 + 10, 9 * 16 + 11, 11 * 16 + 10, 11 * 16 + 11, 9 * 16 + 14, 9 * 16 + 15, 11 * 16 + 14, 11 * 16 + 15},
+      {4 * 16 + 0, 4 * 16 + 1, 6 * 16 + 0, 6 * 16 + 1, 4 * 16 + 4, 4 * 16 + 5, 6 * 16 + 4, 6 * 16 + 5},
+      {5 * 16 + 0, 5 * 16 + 1, 7 * 16 + 0, 7 * 16 + 1, 5 * 16 + 4, 5 * 16 + 5, 7 * 16 + 4, 7 * 16 + 5},
+      {4 * 16 + 2, 4 * 16 + 3, 6 * 16 + 2, 6 * 16 + 3, 4 * 16 + 6, 4 * 16 + 7, 6 * 16 + 6, 6 * 16 + 7},
+      {5 * 16 + 2, 5 * 16 + 3, 7 * 16 + 2, 7 * 16 + 3, 5 * 16 + 6, 5 * 16 + 7, 7 * 16 + 6, 7 * 16 + 7},
+      {12 * 16 + 0, 12 * 16 + 1, 14 * 16 + 0, 14 * 16 + 1, 12 * 16 + 4, 12 * 16 + 5, 14 * 16 + 4, 14 * 16 + 5},
+      {13 * 16 + 0, 13 * 16 + 1, 15 * 16 + 0, 15 * 16 + 1, 13 * 16 + 4, 13 * 16 + 5, 15 * 16 + 4, 15 * 16 + 5},
+      {12 * 16 + 2, 12 * 16 + 3, 14 * 16 + 2, 14 * 16 + 3, 12 * 16 + 6, 12 * 16 + 7, 14 * 16 + 6, 14 * 16 + 7},
+      {13 * 16 + 2, 13 * 16 + 3, 15 * 16 + 2, 15 * 16 + 3, 13 * 16 + 6, 13 * 16 + 7, 15 * 16 + 6, 15 * 16 + 7},
+      {4 * 16 + 8, 4 * 16 + 9, 6 * 16 + 8, 6 * 16 + 9, 4 * 16 + 12, 4 * 16 + 13, 6 * 16 + 12, 6 * 16 + 13},
+      {5 * 16 + 8, 5 * 16 + 9, 7 * 16 + 8, 7 * 16 + 9, 5 * 16 + 12, 5 * 16 + 13, 7 * 16 + 12, 7 * 16 + 13},
+      {4 * 16 + 10, 4 * 16 + 11, 6 * 16 + 10, 6 * 16 + 11, 4 * 16 + 14, 4 * 16 + 15, 6 * 16 + 14, 6 * 16 + 15},
+      {5 * 16 + 10, 5 * 16 + 11, 7 * 16 + 10, 7 * 16 + 11, 5 * 16 + 14, 5 * 16 + 15, 7 * 16 + 14, 7 * 16 + 15},
+      {12 * 16 + 8, 12 * 16 + 9, 14 * 16 + 8, 14 * 16 + 9, 12 * 16 + 12, 12 * 16 + 13, 14 * 16 + 12, 14 * 16 + 13},
+      {13 * 16 + 8, 13 * 16 + 9, 15 * 16 + 8, 15 * 16 + 9, 13 * 16 + 12, 13 * 16 + 13, 15 * 16 + 12, 15 * 16 + 13},
+      {12 * 16 + 10, 12 * 16 + 11, 14 * 16 + 10, 14 * 16 + 11, 12 * 16 + 14, 12 * 16 + 15, 14 * 16 + 14, 14 * 16 + 15},
+      {13 * 16 + 10, 13 * 16 + 11, 15 * 16 + 10, 15 * 16 + 11, 13 * 16 + 14, 13 * 16 + 15, 15 * 16 + 14, 15 * 16 + 15},
+  };
+  return T[lane][reg];
+}
+
+// Convert a 16x16 s/o tile from the wmma m16n16 C fragment layout (s_frag, 8 float per
+// thread, this warp) to the PTX m16n8x2 s_frag layout, via a per-warp 16x16 smem scratch.
+// s_frag = this thread's 8 float (wmma C layout); scratch = this warp's 16x16 tile.
+template <typename KTraits>
+__device__ __forceinline__ void permute_s_frag_wmma_to_ptx(uint32_t lane,
+                                                            uint32_t warp_idx,
+                                                            typename KTraits::DTypeQKAccum* s_frag,
+                                                            float* scratch) {
+  // wmma C layout -> scratch (write this thread's 8 float at the wmma (row,col))
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) {
+    uint32_t rc = wmma_c_rc(lane, r);  // lane is the warp-local lane (0-31); the table is per-lane
+    scratch[rc] = static_cast<float>(s_frag[r]);
+  }
+  __syncwarp();
+  // PTX m16n8x2 s_frag layout: r0-3 = m16n8(n=0-7), r4-7 = m16n8(n=8-15)
+  const uint32_t g = lane / 4, q = lane % 4;
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) {
+    uint32_t row, col;
+    if (r < 4) {
+      row = g + 8 * ((r / 2) & 1);
+      col = 2 * q + (r % 2);
+    } else {
+      row = g + 8 * (((r - 4) / 2) & 1);
+      col = 2 * q + 8 + ((r - 4) % 2);
+    }
+    s_frag[r] = static_cast<typename KTraits::DTypeQKAccum>(scratch[row * 16 + col]);
+  }
+}
+
+// Exact inverse of permute_s_frag_wmma_to_ptx: convert a 16x16 tile from the PTX m16n8x2 layout
+// (frag, 8 per thread) back to the wmma m16n16 C fragment layout, via a per-warp 16x16 smem
+// scratch. Used for o_frag: after the PV mma o_frag is a wmma C accumulator; to rescale it by
+// the per-PTX-row o_scale (update_mdo_states) we must first bring it to the PTX layout, rescale,
+// then convert back to wmma C for the next PV mma.
+template <typename T>
+__device__ __forceinline__ void permute_frag_ptx_to_wmma_c(uint32_t lane, T* frag, float* scratch) {
+  const uint32_t g = lane / 4, q = lane % 4;
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) {
+    uint32_t row, col;
+    if (r < 4) {
+      row = g + 8 * ((r / 2) & 1);
+      col = 2 * q + (r % 2);
+    } else {
+      row = g + 8 * (((r - 4) / 2) & 1);
+      col = 2 * q + 8 + ((r - 4) % 2);
+    }
+    scratch[row * 16 + col] = static_cast<float>(frag[r]);
+  }
+  __syncwarp();
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) {
+    frag[r] = static_cast<T>(scratch[wmma_c_rc(lane, r)]);
+  }
+}
+
+// sm_70: wmma m16n16 row-sum (P * all-ones B -> per-row P sums in the wmma C fragment) plus
+// C-permutation (wmma C -> PTX m16n8x2) of the 2 d values, via a per-warp 16x16 float scratch.
+// a_frag = P in the EXACT wmma m16n16 A fragment layout (the p_a_frag reloaded from smem, NOT
+// the PTX-layout s_frag_f16). d[0] = row-g sum, d[1] = row-(g+8) sum (the PTX m16n8x2
+// convention the prefill mdo/sync/output expect). scratch must be this warp's 16x16 tile.
+template <typename KTraits>
+__device__ __forceinline__ void wmma_rowsum_d(uint32_t lane_idx, const uint32_t* a_frag,
+                                              float* d, float* scratch) {
+  using wmma_frag_a =
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major>;
+  using wmma_frag_b =
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major>;
+  using wmma_frag_c = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>;
+  wmma_frag_a a;
+  wmma_frag_b b;
+  wmma_frag_c c;
+  // a_frag is the full 32-byte wmma m16n16k16 A fragment (uint32_t[8]); copy it whole.
+  memcpy(&a.x, a_frag, sizeof(a.x));
+  nvcuda::wmma::fill_fragment(b, (__half)1.0f);
+  nvcuda::wmma::fill_fragment(c, 0.0f);
+  nvcuda::wmma::mma_sync(c, a, b, c);
+  // wmma C (row-sum matrix; all cols of a row are equal) -> scratch, then PTX read.
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) scratch[wmma_c_rc(lane_idx, r)] = c.x[r];
+  __syncwarp();
+  const uint32_t g = lane_idx / 4, q = lane_idx % 4;
+  d[0] += scratch[g * 16 + 2 * q];            // PTX reg0: row g, col 2q
+  d[1] += scratch[(g + 8) * 16 + 2 * q];      // PTX reg2: row g+8, col 2q
+}
+
+// wmma m16n16k16 A fragment (row-major) (lane,r) -> (row,col). Verified on V100 via
+// /tmp/vllm_runs/wmma_A_rc.cu. Each lane holds ONE row x 8 cols (col = r).
+__device__ __forceinline__ uint32_t wmma_a_row(uint32_t lane) {
+  // row per lane (cols are 0-7 = reg):
+  // lane 0-3:0-3  4-7:8-11  8-11:0-3  12-15:8-11  16-19:4-7  20-23:12-15  24-27:4-7  28-31:12-15
+  static constexpr uint32_t R[32] = {
+      0, 1, 2, 3, 8, 9, 10, 11, 0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+      4, 5, 6, 7, 12, 13, 14, 15};
+  return R[lane];
+}
+
+// Reverse of permute_s_frag_wmma_to_ptx: convert a 16x16 tile from the PTX m16n8x2 layout
+// (frag, 8 per thread) to the wmma m16n16 A fragment (row-major) layout, via a per-warp 16x16
+// smem scratch. Used for the PV mma's P (A): the mdo-produced P is in the PTX layout, but the
+// wmma m16n16 PV mma needs P in the wmma A fragment layout.
+template <typename KTraits, typename T>
+__device__ __forceinline__ void permute_frag_ptx_to_wmma(uint32_t lane, T* frag, float* scratch) {
+  const uint32_t g = lane / 4, q = lane % 4;
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) {
+    uint32_t row, col;
+    if (r < 4) {
+      row = g + 8 * ((r / 2) & 1);
+      col = 2 * q + (r % 2);
+    } else {
+      row = g + 8 * (((r - 4) / 2) & 1);
+      col = 2 * q + 8 + ((r - 4) % 2);
+    }
+    scratch[row * 16 + col] = static_cast<float>(frag[r]);
+  }
+  __syncwarp();
+  const uint32_t a_row = wmma_a_row(lane);
+#pragma unroll
+  for (uint32_t r = 0; r < 8; ++r) {
+    frag[r] = static_cast<T>(scratch[a_row * 16 + r]);
+  }
+}
+
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           bool ENABLE_FP4_REPACK = false, bool kEnableVOSplitOpt = false>
@@ -245,6 +444,41 @@ struct SharedStorageQKVO
       KVRepackSmem<DTypeQ, DTypeKV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO,
                    ENABLE_FP4_REPACK>,
       VOSplitSmem<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_VO, DTypeQ, kEnableVOSplitOpt> {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+   // sm_70 kLinear: the main smem (q_smem/k_smem/v_smem) is PLAIN; wmma reads it directly.
+   // C-permutation scratch: 16x16 float per warp to convert the wmma m16n16 C fragment
+   // (QK s / PV o) to the PTX m16n8x2 s_frag layout (see permute_s_frag_wmma_to_ptx).
+   // One 16x16 tile per warp (reused across the mma_q x mma_kv permutations).
+    alignas(16) float s_perm_smem[(CTA_TILE_Q / 16) * NUM_WARPS_KV * 16 * 16];
+    // half P-scratch for the PV mma: scatter the PTX-layout P (s_frag_f16) to row-major smem,
+    // reload via wmma_ldm_a to get the exact wmma m16n16 A fragment layout (no table needed).
+    alignas(16) half p_perm_smem[(CTA_TILE_Q / 16) * NUM_WARPS_KV * 16 * 16];
+    __device__ __forceinline__ float* s_perm_ptr(uint32_t warp_idx) {
+      return s_perm_smem + warp_idx * (16 * 16);
+    }
+    __device__ __forceinline__ half* p_perm_ptr(uint32_t warp_idx) {
+      return p_perm_smem + warp_idx * (16 * 16);
+    }
+ #else
+   __device__ __forceinline__ float* s_perm_ptr(uint32_t warp_idx) {
+     (void)warp_idx;
+     return nullptr;
+   }
+ #endif
+   // kLinear (sm_70): the main smem is plain; wmma reads it directly, so no separate plain
+   // buffer. deswizzle_qkv is a no-op + q/k/v_plain_ptr return the main smem (unused).
+   __device__ __forceinline__ void deswizzle_qkv(uint32_t num_threads) {
+     (void)num_threads;
+   }
+   __device__ __forceinline__ DTypeQ* q_plain_ptr() {
+     return q_smem;
+   }
+   __device__ __forceinline__ DTypeKV* k_plain_ptr() {
+     return k_smem;
+   }
+   __device__ __forceinline__ DTypeKV* v_plain_ptr() {
+     return v_smem;
+   }
   static constexpr bool kKVShareShape =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
   static constexpr bool kVOSplit = kEnableVOSplitOpt && kKVShareShape;
@@ -383,11 +617,38 @@ struct KernelTraits {
   static constexpr uint32_t CTA_TILE_Q = CTA_TILE_Q_;
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
 
-  static constexpr SwizzleMode SWIZZLE_MODE_Q = SwizzleMode::k128B;
+  // Plan B (sm_70, no ldmatrix): main smem is PLAIN (kLinear) so wmma::load_matrix_sync reads
+  // it directly (no de-swizzle, no separate plain buffer -> no smem doubling; the swizzled+plain
+  // would exceed the V100 96KB limit for D=128). The producer/consumer offset flow uses kLinear
+  // (plain) advances; the swizzle-specific `^0x2` xors in the warp-column flow become `+`.
+  static constexpr SwizzleMode SWIZZLE_MODE_Q =
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
+      SwizzleMode::kLinear
+#else
+      SwizzleMode::k128B
+#endif
+  ;
   static constexpr SwizzleMode SWIZZLE_MODE_KV =
-      (sizeof(DTypeKV_) == 1 && HEAD_DIM_VO == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
-  static constexpr uint32_t KV_THR_LAYOUT_ROW = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 8;
-  static constexpr uint32_t KV_THR_LAYOUT_COL = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 8 : 4;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
+      SwizzleMode::kLinear
+#else
+      (sizeof(DTypeKV_) == 1 && HEAD_DIM_VO == 64) ? SwizzleMode::k64B : SwizzleMode::k128B
+#endif
+  ;
+  // sm_70 (V100): no ldmatrix, so fragments load via wmma::load_matrix_sync on the (plain,
+  // kLinear) main smem. sm_75+ uses ldmatrix directly.
+  static constexpr bool USE_WMMA_LOAD =
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
+      true
+#else
+      false
+#endif
+  ;
+  // kLinear (sm_70 wmma path) uses the same b128 tiling / warp layout as k128B.
+  static constexpr bool KV_IS_128B =
+      (SWIZZLE_MODE_KV == SwizzleMode::k128B || SWIZZLE_MODE_KV == SwizzleMode::kLinear);
+  static constexpr uint32_t KV_THR_LAYOUT_ROW = KV_IS_128B ? 4 : 8;
+  static constexpr uint32_t KV_THR_LAYOUT_COL = KV_IS_128B ? 8 : 4;
   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
@@ -587,7 +848,7 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
       produce_v ? KTraits::UPCAST_STRIDE_V : KTraits::UPCAST_STRIDE_K;
   const uint32_t warp_idx = get_warp_idx<KTraits>(tid.y, tid.z), lane_idx = tid.x;
 
-  if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
+  if constexpr (KTraits::KV_IS_128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
     static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
@@ -658,7 +919,7 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
   // Use a 64b async load (cp.async with src-size=8) and advance GMEM pointer by half the normal
   // amount, while SMEM addressing remains unchanged.
   constexpr bool IS_FP4 = is_fp4_type_v<DType>;
-  if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
+  if constexpr (KTraits::KV_IS_128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
     static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
@@ -746,7 +1007,7 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
       produce_v ? KTraits::UPCAST_STRIDE_V : KTraits::UPCAST_STRIDE_K;
   constexpr bool IS_FP4 = is_fp4_type_v<DType>;
 
-  if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
+  if constexpr (KTraits::KV_IS_128B) {
     constexpr uint32_t ROWS_PER_ITER = 4;
     uint32_t kv_idx = kv_idx_base + warp_idx * ROWS_PER_ITER + lane_idx / 8;
     static_assert(NUM_MMA_KV * ROWS_PER_ITER % NUM_WARPS_Q == 0);
@@ -1365,7 +1626,9 @@ template <typename KTraits, bool REPACK_BF16 = false>
 __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
     smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r, uint8_t* k_sf_smem,
-    uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+    uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem_plain = nullptr,
+    smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem_plain = nullptr) {
   constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
   constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
   // When reading from the BF16 repack buffer, K is laid out as native 16-bit, so
@@ -1373,13 +1636,21 @@ __device__ __forceinline__ void compute_qk(
   constexpr uint32_t KV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_QK : UPCAST_STRIDE_K;
   constexpr uint32_t KV_ESIZE =
       REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeKV);
-  uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
+  // sm_70 wmma m16n16k16 A/B fragments are 32 bytes (8 x uint32); sm80+ ldmatrix only fills the
+  // low 4 (m16n8k16 pair). Allocate 8 for the wmma path; the ldmatrix path leaves the high 4
+  // unused.
+  uint32_t a_frag[KTraits::NUM_MMA_Q][8], b_frag[8];
   // compute q*k^T
 #pragma unroll
   for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK; ++mma_d) {
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-      q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, a_frag[mma_q]);
+      if constexpr (KTraits::USE_WMMA_LOAD)
+        // kLinear main smem is plain; read it directly (raw offset, no de-swizzle inversion).
+        q_smem->template wmma_ldm_a<typename KTraits::DTypeQ>(
+            *q_smem_offset_r, UPCAST_STRIDE_Q, a_frag[mma_q]);
+      else
+        q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, a_frag[mma_q]);
       *q_smem_offset_r =
           q_smem->template advance_offset_by_row<16, UPCAST_STRIDE_Q>(*q_smem_offset_r);
     }
@@ -1388,7 +1659,7 @@ __device__ __forceinline__ void compute_qk(
                        KTraits::NUM_MMA_Q * 16 * UPCAST_STRIDE_Q;
 
 #pragma unroll
-    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+     for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
       if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
         uint32_t b_frag_quant[2];
         if (mma_d % 2 == 0) {
@@ -1427,10 +1698,32 @@ __device__ __forceinline__ void compute_qk(
           *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_b);
           *(packed2_*)&b_frag[3] = __hmul2(*(packed2_*)&b_frag[3], scale_b);
         }
-      } else {
-        k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
-      }
-      *k_smem_offset_r = k_smem->template advance_offset_by_row<16, KV_STRIDE>(*k_smem_offset_r);
+       } else {
+          if constexpr (KTraits::USE_WMMA_LOAD)
+            // kLinear main smem is plain; read it directly (raw offset).
+            k_smem->template wmma_ldm_b_col<typename KTraits::DTypeKV>(
+                *k_smem_offset_r, KV_STRIDE, b_frag);
+          else
+            k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
+       }
+        *k_smem_offset_r = k_smem->template advance_offset_by_row<16, KV_STRIDE>(*k_smem_offset_r);
+#ifdef SM70_DEBUG_PRINT
+        if constexpr (KTraits::USE_WMMA_LOAD) {
+          if (mma_d == 0 && mma_kv == 0 && lane_idx == 0) {
+            int a_nan = 0, b_nan = 0;
+            for (uint32_t r = 0; r < 4; ++r) {
+              __half2 ah = *reinterpret_cast<__half2*>(a_frag + r);
+              a_nan += (int)!isfinite((float)ah.x) + (int)!isfinite((float)ah.y);
+              __half2 bh = *reinterpret_cast<__half2*>(b_frag + r);
+              b_nan += (int)!isfinite((float)bh.x) + (int)!isfinite((float)bh.y);
+            }
+            __half2 a0 = *reinterpret_cast<__half2*>(a_frag);
+            __half2 b0 = *reinterpret_cast<__half2*>(b_frag);
+            printf("[dbgFRAG] d0kv0 a_nan=%d b_nan=%d a0=[%g %g] b0=[%g %g]\n", a_nan, b_nan,
+                   (float)a0.x, (float)a0.y, (float)b0.x, (float)b0.y);
+          }
+        }
+#endif
 
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
@@ -1533,17 +1826,23 @@ __device__ __forceinline__ void compute_qk_fp4_rope(
 
 #pragma unroll
   for (uint32_t mma_di = 0; mma_di < NUM_MMA_D_HALF; ++mma_di) {
-    uint32_t a_frag_first[KTraits::NUM_MMA_Q][4], a_frag_second[KTraits::NUM_MMA_Q][4];
+    // sm_70 wmma m16n16k16 A fragments are 32 bytes (8 x uint32); ldmatrix fills low 4 only.
+    uint32_t a_frag_first[KTraits::NUM_MMA_Q][8], a_frag_second[KTraits::NUM_MMA_Q][8];
     uint32_t q_smem_offset_first_mma = q_smem_offset_first;
     uint32_t q_smem_offset_second_mma =
         q_smem->template advance_offset_by_column<KTraits::NUM_MMA_D_QK>(q_smem_offset_first, 0);
 
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-      q_smem->ldmatrix_m8n8x4(q_smem_offset_first_mma, a_frag_first[mma_q]);
+      if constexpr (KTraits::SWIZZLE_MODE_Q == SwizzleMode::kLinear) {
+        q_smem->template wmma_ldm_a<typename KTraits::DTypeQ>(q_smem_offset_first_mma, UPCAST_STRIDE_Q, a_frag_first[mma_q]);
+        q_smem->template wmma_ldm_a<typename KTraits::DTypeQ>(q_smem_offset_second_mma, UPCAST_STRIDE_Q, a_frag_second[mma_q]);
+      } else {
+        q_smem->ldmatrix_m8n8x4(q_smem_offset_first_mma, a_frag_first[mma_q]);
+        q_smem->ldmatrix_m8n8x4(q_smem_offset_second_mma, a_frag_second[mma_q]);
+      }
       q_smem_offset_first_mma =
           q_smem->template advance_offset_by_row<16, UPCAST_STRIDE_Q>(q_smem_offset_first_mma);
-      q_smem->ldmatrix_m8n8x4(q_smem_offset_second_mma, a_frag_second[mma_q]);
       q_smem_offset_second_mma =
           q_smem->template advance_offset_by_row<16, UPCAST_STRIDE_Q>(q_smem_offset_second_mma);
     }
@@ -1553,7 +1852,8 @@ __device__ __forceinline__ void compute_qk_fp4_rope(
 
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-      uint32_t b_frag_first[4], b_frag_second[4];
+      // sm_70 wmma m16n16k16 B fragments are 32 bytes (8 x uint32); ldmatrix fills low 4 only.
+      uint32_t b_frag_first[8], b_frag_second[8];
       load_fp4_k_frag_scaled<KTraits>(k_smem, k_smem_offset_first_mma, k_sf_smem, lane_idx, mma_kv,
                                       mma_di, b_frag_first);
       load_fp4_k_frag_scaled<KTraits>(k_smem, k_smem_offset_second_mma, k_sf_smem, lane_idx, mma_kv,
@@ -1794,8 +2094,12 @@ __device__ __forceinline__ void update_mdo_states(
   if constexpr (use_softmax) {
     const float sm_scale = variant.sm_scale_log2;
     if constexpr (std::is_same_v<DTypeQKAccum, float>) {
+      // NOTE (sm_70): o_frag is the wmma m16n16 C accumulator (PV mma). On sm_70 the caller
+      // permutes o_frag wmma C -> PTX before calling this and back to wmma C after, so the
+      // per-register rescale below (PTX m16n8x2 j-group indices) is correct for BOTH arches.
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        float o_scale_buf[2];
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
           float m_prev = m[mma_q][j];
@@ -1806,20 +2110,36 @@ __device__ __forceinline__ void update_mdo_states(
                     max(s_frag[mma_q][mma_kv][j * 2 + 4], s_frag[mma_q][mma_kv][j * 2 + 5]));
             m[mma_q][j] = max(m[mma_q][j], m_local);
           }
+#ifdef SM70_DEBUG_PRINT
+          if (mma_q == 0 && j == 0 && threadIdx.x == 0) {
+            printf("[dbgMDOL] b(%u,%u,w%u) before_shfl m00=%g s000=%g s001=%g s004=%g s005=%g s100=%g s101=%g\n",
+                   blockIdx.x, blockIdx.y, (int)threadIdx.y, (float)m[mma_q][j], (float)s_frag[0][0][0],
+                   (float)s_frag[0][0][1], (float)s_frag[0][0][4], (float)s_frag[0][0][5],
+                   (float)s_frag[0][1][0], (float)s_frag[0][1][1]);
+          }
+#endif
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
+#ifdef SM70_DEBUG_PRINT
+          if (mma_q == 0 && j == 0 && threadIdx.x == 0) {
+            printf("[dbgMDOA] b(%u,%u,w%u) after_shfl m00=%g m01=%g\n", blockIdx.x, blockIdx.y,
+                   (int)threadIdx.y, (float)m[0][0], (float)m[0][1]);
+          }
+#endif
 
           // Per-row clamp: fully masked rows (m == -inf) yield exp2(-inf) = 0, not NaN.
           const float m_scaled =
               max(m[mma_q][j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m_scaled);
-          d[mma_q][j] *= o_scale;
+          o_scale_buf[j] = math::ptx_exp2(m_prev * sm_scale - m_scaled);
+          d[mma_q][j] *= o_scale_buf[j];
+          // Rescale the j-group registers in place. o_frag is in the PTX m16n8x2 layout here
+          // (sm_70 permutes it wmma C -> PTX before this call; sm80+ is PTX natively).
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
-            o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
-            o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
-            o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
-            o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
+            o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale_buf[j];
+            o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale_buf[j];
+            o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale_buf[j];
+            o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale_buf[j];
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
@@ -1884,7 +2204,9 @@ template <typename KTraits, bool REPACK_BF16 = false>
 __device__ __forceinline__ void compute_sfm_v(
     smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,
     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
-    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2], const uint32_t d_base = 0) {
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2], const uint32_t d_base = 0,
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem_plain = nullptr, float* c_perm_scratch = nullptr,
+    uint32_t c_perm_warp = 0, half* p_scratch = nullptr) {
   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
   // When reading from the BF16 repack buffer, V is native 16-bit.
   constexpr uint32_t VV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_VO : UPCAST_STRIDE_V;
@@ -1892,6 +2214,9 @@ __device__ __forceinline__ void compute_sfm_v(
       REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeKV);
 
   typename KTraits::DTypeQ s_frag_f16[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
+  // sm_70 kLinear: wmma m16n16 A fragment of the P (reloaded from the P smem scratch). The wmma
+  // m16n16k16 A fragment is 32 bytes (8 x uint32); allocate 8 (ldmatrix path uses low 4 only).
+  uint32_t p_a_frag[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
   if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
@@ -1899,6 +2224,36 @@ __device__ __forceinline__ void compute_sfm_v(
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
         vec_cast<typename KTraits::DTypeQ, float>::cast<8>(s_frag_f16[mma_q][mma_kv],
                                                            s_frag[mma_q][mma_kv]);
+      }
+    }
+    // sm_70 kLinear: the P (s_frag_f16) is in the PTX layout (post-QK-permutation), but the
+    // wmma m16n16 PV mma needs P in the wmma m16n16 A fragment layout. Scatter the PTX-layout P
+    // to a row-major smem scratch + reload via wmma_ldm_a (the exact wmma A layout, no table).
+    if constexpr (KTraits::USE_WMMA_LOAD) {
+      const uint32_t g = lane_idx / 4, q = lane_idx % 4;
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+        for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+          // PTX m16n8x2 (row,col) scatter into the 16x16 row-major scratch.
+          half* ps = p_scratch;
+#pragma unroll
+          for (uint32_t r = 0; r < 8; ++r) {
+            uint32_t row, col;
+            if (r < 4) {
+              row = g + 8 * ((r / 2) & 1);
+              col = 2 * q + (r % 2);
+            } else {
+              row = g + 8 * (((r - 4) / 2) & 1);
+              col = 2 * q + 8 + ((r - 4) % 2);
+            }
+            ps[row * 16 + col] = s_frag_f16[mma_q][mma_kv][r];
+          }
+          __syncwarp();
+          smem_t<SwizzleMode::kLinear> pst((b128_t*)ps);
+          // 16 half-wide row = 32 bytes = 2 b128 -> lead_b128 = 2.
+          pst.template wmma_ldm_a<typename KTraits::DTypeQ>(0, 2, p_a_frag[mma_q][mma_kv]);
+        }
       }
     }
   }
@@ -1909,7 +2264,12 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
         if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: P in the exact wmma A layout (p_a_frag) + wmma C->PTX d permutation.
+            wmma_rowsum_d<KTraits>(lane_idx, p_a_frag[mma_q][mma_kv], d[mma_q], c_perm_scratch);
+          } else {
+            mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          }
         } else {
           mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
         }
@@ -1922,7 +2282,8 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
       if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
-        uint32_t b_frag[4];
+        // sm_70 wmma m16n16k16 B fragment is 32 bytes (8 x uint32); ldmatrix fills low 4 only.
+        uint32_t b_frag[8];
         if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
           uint32_t b_frag_quant[2];
           if (mma_d % 2 == 0) {
@@ -1963,17 +2324,28 @@ __device__ __forceinline__ void compute_sfm_v(
             *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
             *(packed2_*)&b_frag[3] = __hmul2(*(packed2_*)&b_frag[3], scale_hi);
           }
-        } else {
-          v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
+         } else {
+           if constexpr (KTraits::USE_WMMA_LOAD)
+             // kLinear main smem is plain; read it directly (raw offset).
+             v_smem->template wmma_ldm_b_row<typename KTraits::DTypeKV>(
+                 *v_smem_offset_r, VV_STRIDE, b_frag);
+           else
+             v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
         }
         const uint32_t mma_d_local = mma_d - d_base;
 #pragma unroll
-        for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-          if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
-                o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
-          } else {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+         for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+           if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
+             if constexpr (KTraits::USE_WMMA_LOAD) {
+               // kLinear: P is reloaded into the wmma m16n16 A fragment (p_a_frag).
+               mma::mma_sync_m16n16k16_row_row_f16f16f32<typename KTraits::DTypeQ>(
+                   o_frag[mma_q][mma_d_local], p_a_frag[mma_q][mma_kv], b_frag);
+             } else {
+               mma::mma_sync_m16n16k16_row_row_f16f16f32<typename KTraits::DTypeQ>(
+                   o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+             }
+           } else {
+            mma::mma_sync_m16n16k16_row_row_f16f16f32<typename KTraits::DTypeQ>(
                 o_frag[mma_q][mma_d_local], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
           }
         }
@@ -2452,8 +2824,12 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       } else {
         init_states<KTraits>(variant, o_frag, m, d);
       }
+      // sm_70 (wmma load_matrix_sync) needs a warp-UNIFORM leading pointer; sm_80+ (ldmatrix)
+      // needs the per-lane addresses.
       uint32_t q_smem_offset_r = qo_smem.template get_permuted_offset<UPCAST_STRIDE_Q>(
-          get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+          get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 +
+              (KTraits::USE_WMMA_LOAD ? 0u : lane_idx % 16),
+          (KTraits::USE_WMMA_LOAD ? 0u : lane_idx / 16));
       load_q_global_smem<KTraits>(qo_packed_idx_base, qo_len, q_ptr_base, q_stride_n, q_stride_h,
                                   group_size, &qo_smem, tid);
 
@@ -2469,6 +2845,11 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
           v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
+      // sm_70: de-swizzled plain buffers for wmma::load_matrix_sync (filled by deswizzle_qkv).
+      // On sm_80+ q/k/v_plain_ptr() return nullptr and these are unused (USE_WMMA_LOAD=false).
+      smem_t<SWIZZLE_MODE_Q> q_plain_sm(smem_storage.q_plain_ptr());
+      smem_t<SWIZZLE_MODE_KV> k_plain_sm(smem_storage.k_plain_ptr());
+      smem_t<SWIZZLE_MODE_KV> v_plain_sm(smem_storage.v_plain_ptr());
 
       const uint32_t num_iterations = ceil_div(
           MASK_MODE == MaskMode::kCausal
@@ -2503,19 +2884,22 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           kv_head_idx * v_stride_h +
           (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
 
+      // sm_70 (wmma load_matrix_sync) needs a warp-UNIFORM leading pointer; sm_80+ (ldmatrix)
+      // needs the per-lane addresses.
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
-                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
-                       lane_idx % 8,
-                   (lane_idx % 16) / 8),
-               v_smem_offset_r = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16,
-                   lane_idx / 16),
-               k_smem_offset_w = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
-                   warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
-                   lane_idx % KV_THR_LAYOUT_COL),
-               v_smem_offset_w = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-                   warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
-                   lane_idx % KV_THR_LAYOUT_COL);
+                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
+                       (KTraits::USE_WMMA_LOAD ? 0u : 8 * (lane_idx / 16) + lane_idx % 8),
+                   (KTraits::USE_WMMA_LOAD ? 0u : (lane_idx % 16) / 8)),
+                v_smem_offset_r = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
+                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
+                        (KTraits::USE_WMMA_LOAD ? 0u : lane_idx % 16),
+                    (KTraits::USE_WMMA_LOAD ? 0u : lane_idx / 16)),
+                k_smem_offset_w = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
+                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
+                    lane_idx % KV_THR_LAYOUT_COL),
+                v_smem_offset_w = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
+                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
+                    lane_idx % KV_THR_LAYOUT_COL);
 
       // Single prefill takes the repack for FP4 only. Whenever this variant allocates the staging
       // buffer -- it shares SharedStorage with the ragged kernel, and USE_KV_REPACK decides both --
@@ -2539,6 +2923,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         v_smem_offset_r_bf16 = v_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_VO>(
             get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16, lane_idx / 16);
       }
+
       // For single prefill, the absolute KV base is just chunk_start (no kv_indptr offset).
       const uint32_t kv_abs_base = chunk_start;
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
@@ -2565,6 +2950,27 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           cp_async::wait_group<1>();
         }
         block.sync();
+        smem_storage.deswizzle_qkv(KTraits::NUM_THREADS);  // sm_70: K(iter)+Q -> plain (no-op sm_80+)
+#ifdef SM70_DEBUG_PRINT
+        if (iter == 0 && tid.x == 0 && tid.y == 0 && tid.z == 0) {
+          const half* kbase = reinterpret_cast<const half*>(k_smem.base);
+          const half* vbase = reinterpret_cast<const half*>(v_smem.base);
+          // K mma tile0 = rows 0-15, d 0-15; tile1 = rows 16-31; Q tile = rows 0-15 d 0-15.
+          const half* qbase = reinterpret_cast<const half*>(qo_smem.base);
+          printf("[dbgKV] b(%u,%u) qsm[0..3]=[%g %g %g %g] krow0[0..3]=[%g %g %g %g] "
+                 "krow16[0..3]=[%g %g %g %g] krow0d16=[%g %g %g %g] "
+                 "qoff=%u koff=%u voff=%u samekv=%d\n",
+                 bx, kv_head_idx, (float)qbase[0], (float)qbase[1], (float)qbase[2],
+                 (float)qbase[3], (float)kbase[0], (float)kbase[1], (float)kbase[2],
+                 (float)kbase[3], (float)kbase[16 * UPCAST_STRIDE_K * 8],
+                 (float)kbase[16 * UPCAST_STRIDE_K * 8 + 1],
+                 (float)kbase[16 * UPCAST_STRIDE_K * 8 + 2],
+                 (float)kbase[16 * UPCAST_STRIDE_K * 8 + 3],
+                 (float)kbase[16], (float)kbase[17], (float)kbase[18], (float)kbase[19],
+                 q_smem_offset_r, k_smem_offset_r, v_smem_offset_r,
+                 (int)(k_smem.base == v_smem.base));
+        }
+#endif
 
         uint32_t kv_idx_base =
             chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
@@ -2596,13 +3002,79 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
         } else {
-          compute_qk<KTraits>(
-              &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-              smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_QK),
-              lane_idx, s_frag);
+          // plain smem_t always passed; used only when USE_WMMA_LOAD (sm_70), else ldmatrix.
+           compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
+                               smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) *
+                                                          KTraits::NUM_MMA_KV * 16 *
+                                                          KTraits::NUM_MMA_D_QK),
+                               lane_idx, s_frag, &q_plain_sm, &k_plain_sm);
+         }
+#ifdef SM70_DEBUG_PRINT
+        if constexpr (KTraits::USE_WMMA_LOAD) {
+          if (iter == 0 && tid.x == 0 && tid.y == 0 && tid.z == 0 && lane_idx == 0) {
+            printf("[dbgCFG] b(%u,%u) CTA_TILE_Q=%u NUM_MMA_Q=%u NUM_MMA_KV=%u NUM_WARPS_Q=%u "
+                   "NUM_WARPS_KV=%u CTA_TILE_KV=%u NUM_MMA_D_QK=%u NUM_MMA_D_VO_TILE=%u\n",
+                   bx, kv_head_idx, KTraits::CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_WARPS_Q,
+                   NUM_WARPS_KV, KTraits::CTA_TILE_KV, KTraits::NUM_MMA_D_QK,
+                   KTraits::NUM_MMA_D_VO_TILE);
+            float s_min = 1e30f, s_max = -1e30f;
+            int s_nan = 0;
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq)
+              for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv)
+                for (uint32_t r = 0; r < 8; ++r) {
+                  float v = s_frag[mq][mkv][r];
+                  if (isfinite(v)) {
+                    s_min = fminf(s_min, v);
+                    s_max = fmaxf(s_max, v);
+                  } else {
+                    s_nan++;
+                  }
+                }
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq)
+              for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv) {
+                printf("[dbgPRE] b(%u,%u,%u) mq%u tile%u r0=[%g %g %g %g %g %g %g %g]\n", bx,
+                       chunk_idx, kv_head_idx, mq, mkv, s_frag[mq][mkv][0], s_frag[mq][mkv][1],
+                       s_frag[mq][mkv][2], s_frag[mq][mkv][3], s_frag[mq][mkv][4],
+                       s_frag[mq][mkv][5], s_frag[mq][mkv][6], s_frag[mq][mkv][7]);
+              }
+            printf("[dbgPRE] b(%u,%u,%u) wmmaC smin=%g smax=%g snan=%d\n", bx, chunk_idx,
+                   kv_head_idx, s_min, s_max, s_nan);
+          }
         }
-        logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
+#endif
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: s_frag from the wmma m16n16 mma is in the wmma C fragment layout; permute it
+            // to the PTX m16n8x2 s_frag layout the mdo/pv/store expect, via a per-warp 16x16 smem
+            // scratch (see permute_s_frag_wmma_to_ptx).
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv) {
+                permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, s_frag[mq][mkv],
+                                                    smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+#ifdef SM70_DEBUG_PRINT
+            if (iter == 0 && tid.x == 0 && tid.y == 0 && tid.z == 0 && lane_idx == 0) {
+              float s_min = 1e30f, s_max = -1e30f;
+              int s_nan = 0;
+              for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq)
+                for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv)
+                  for (uint32_t r = 0; r < 8; ++r) {
+                    float v = s_frag[mq][mkv][r];
+                    if (isfinite(v)) {
+                      s_min = fminf(s_min, v);
+                      s_max = fmaxf(s_max, v);
+                    } else {
+                      s_nan++;
+                    }
+                  }
+              printf("[dbgPOST] b(%u,%u,%u) ptx r0=[%g %g %g %g %g %g %g %g] smin=%g smax=%g snan=%d\n",
+                     bx, chunk_idx, kv_head_idx, s_frag[0][0][0], s_frag[0][0][1], s_frag[0][0][2],
+                     s_frag[0][0][3], s_frag[0][0][4], s_frag[0][0][5], s_frag[0][0][6],
+                     s_frag[0][0][7], s_min, s_max, s_nan);
+            }
+#endif
+          }
+         logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                                   qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
 
         // apply mask
@@ -2617,6 +3089,17 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                            get_warp_idx_kv<KTraits>(tid.z),
                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
         } else {
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: o_frag is the wmma m16n16 C accumulator (PV mma). Bring it to the PTX m16n8x2
+            // layout so update_mdo_states can rescale it per PTX row (the wmma C rows a thread holds
+            // do NOT align with the PTX j-group o_scale). Converted back to wmma C after.
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t dv = 0; dv < KTraits::NUM_MMA_D_VO_TILE; ++dv) {
+                permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, o_frag[mq][dv],
+                                                    smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+          }
           update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         }
 
@@ -2637,8 +3120,33 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           cp_async::commit_group();
           cp_async::wait_group<1>();
         }
-        block.sync();
+          block.sync();
+         smem_storage.deswizzle_qkv(KTraits::NUM_THREADS);  // sm_70: V(iter) -> plain (no-op sm_80+)
 
+#ifdef SM70_DEBUG_PRINT
+        if (iter == 0 && tid.x == 0 && tid.y == 0 && tid.z == 0) {
+          float s_max = 0, p_min = 1e30f;
+          int s_nan = 0;
+          for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+            for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv) {
+              for (uint32_t r = 0; r < 8; ++r) {
+                if (isfinite(s_frag[mq][mkv][r])) {
+                  s_max = fmaxf(s_max, fabsf(s_frag[mq][mkv][r]));
+                  p_min = fminf(p_min, s_frag[mq][mkv][r]);
+                } else {
+                  s_nan++;
+                }
+              }
+            }
+          }
+          printf("[dbgMDO] b(%u,%u) smax=%g pmin=%g snan=%d m00=%g m01=%g d00=%g d01=%g", bx,
+                 kv_head_idx, s_max, p_min, s_nan, m[0][0], m[0][1], d[0][0], d[0][1]);
+          if constexpr (NUM_MMA_Q > 1) {
+            printf(" m10=%g m11=%g d10=%g d11=%g", m[1][0], m[1][1], d[1][0], d[1][1]);
+          }
+          printf("\n");
+        }
+#endif
         // compute sfm*v
         if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
           const uint32_t warp_vo_base =
@@ -2657,12 +3165,47 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_VO),
               lane_idx, s_frag, o_frag, d, d_base);
         } else {
-          compute_sfm_v<KTraits>(
-              &v_smem, &v_smem_offset_r,
-              smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_VO),
-              lane_idx, s_frag, o_frag, d, d_base);
-        }
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: o_frag was permuted to PTX before update_mdo_states (for the per-PTX-row
+            // rescale). Convert it back to the wmma m16n16 C layout so the PV mma below can
+            // accumulate into it.
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t dv = 0; dv < KTraits::NUM_MMA_D_VO_TILE; ++dv) {
+                permute_frag_ptx_to_wmma_c<float>(lane_idx, o_frag[mq][dv],
+                                                   smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+          }
+           compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r,
+                                  smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) *
+                                                             KTraits::NUM_MMA_KV * 16 *
+                                                             KTraits::NUM_MMA_D_VO),
+                                   lane_idx, s_frag, o_frag, d, d_base, &v_plain_sm,
+                                   smem_storage.s_perm_ptr(warp_idx), warp_idx,
+                                   smem_storage.p_perm_ptr(warp_idx));
+          }
+             // sm_70 kLinear: o_frag lives in the wmma m16n16 C layout as the PV mma accumulator.
+             // Each iteration it is permuted wmma C -> PTX (for the per-PTX-row rescale in
+             // update_mdo_states) and back to wmma C (before the next PV mma), so it is in wmma C
+             // when the loop ends. The final wmma C -> PTX permute (before write_o) is done once,
+             // after the loop, below.
+#ifdef SM70_DEBUG_PRINT
+            if (iter == 0 && tid.x == 0 && tid.y == 0 && tid.z == 0 && lane_idx == 0) {
+              float o_max = 0;
+              int o_nan = 0;
+              for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq)
+                for (uint32_t dv = 0; dv < KTraits::NUM_MMA_D_VO_TILE; ++dv)
+                  for (uint32_t r = 0; r < 8; ++r) {
+                    if (isfinite(o_frag[mq][dv][r])) {
+                      o_max = fmaxf(o_max, fabsf(o_frag[mq][dv][r]));
+                    } else {
+                      o_nan++;
+                    }
+                  }
+              printf("[dbgO] b(%u,%u) o_max=%g o_nan=%d o_r0=[%g %g %g %g]\n", bx, kv_head_idx, o_max,
+                     o_nan, o_frag[0][0][0], o_frag[0][0][1], o_frag[0][0][2], o_frag[0][0][3]);
+             }
+#endif
 
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
@@ -2681,12 +3224,24 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           cp_async::commit_group();
         }
       }
-      cp_async::wait_group<0>();
-      block.sync();
+       cp_async::wait_group<0>();
+       block.sync();
 
-      finalize_m<KTraits>(variant, m);
+       if constexpr (KTraits::USE_WMMA_LOAD) {
+         // sm_70 kLinear: o_frag has accumulated in the wmma m16n16 C layout through the whole KV
+         // loop (PV mma accumulator). Now permute it once to the PTX m16n8x2 layout that
+         // threadblock_sync_mdo_states / transform_output / write_o expect.
+         for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+           for (uint32_t dv = 0; dv < KTraits::NUM_MMA_D_VO_TILE; ++dv) {
+             permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, o_frag[mq][dv],
+                                                 smem_storage.s_perm_ptr(warp_idx));
+           }
+         }
+       }
 
-      if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
+       finalize_m<KTraits>(variant, m);
+
+       if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_chunks * o_stride_n : o_stride_n, o_stride_h,
                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
@@ -2913,14 +3468,32 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
             using SmemStorage = std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
                                                    typename KTraits::SharedStoragePaged,
                                                    typename KTraits::SharedStorage>;
-            size_t smem_size = sizeof(SmemStorage);
-            if (smem_size > (size_t)max_smem_per_block_optin) {
-              std::ostringstream err_msg;
-              err_msg << "Required shared memory (" << smem_size
-                      << " bytes) for head_dim_qk=" << HEAD_DIM_QK
-                      << ", head_dim_vo=" << HEAD_DIM_VO << ", cta_tile_q=" << CTA_TILE_Q
-                      << " exceeds this GPU's per-block limit (" << max_smem_per_block_optin
-                      << " bytes); this configuration is not supported on this architecture.";
+             size_t smem_size = sizeof(SmemStorage);
+             // sm_70: the de-swizzle plain K/V/Q buffers are gated by __CUDA_ARCH__
+             // (device-only), so host sizeof(SmemStorage) excludes them. Add their size
+             // when running on sm_70, else the kernel de-swizzles past the allocated smem.
+             {
+               int cc_major = 0, cc_minor = 0;
+               FLASHINFER_CUDA_CALL(
+                   cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev_id));
+               FLASHINFER_CUDA_CALL(
+                   cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev_id));
+                 if (cc_major == 7 && cc_minor == 0) {  // sm_70 only
+                   // kLinear: main smem is plain (already in sizeof(SmemStorage)); add the
+                   // C-permutation scratch (s_perm_smem, float) + the PV P-scratch (p_perm_smem,
+                   // half), both per-warp 16x16.
+                   smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 *
+                                   16 * sizeof(float);
+                   smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 *
+                                   16 * sizeof(half);
+                 }
+             }
+             if (smem_size > (size_t)max_smem_per_block_optin) {
+               std::ostringstream err_msg;
+               err_msg << "Required shared memory (" << smem_size
+                       << " bytes) for head_dim_qk=" << HEAD_DIM_QK
+                       << " exceeds this GPU's per-block limit (" << max_smem_per_block_optin
+                       << " bytes); this configuration is not supported on this architecture.";
               FLASHINFER_ERROR(err_msg.str());
             }
             FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -3184,8 +3757,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       } else {
         init_states<KTraits>(variant, o_frag, m, d);
       }
+      // sm_70 (wmma load_matrix_sync) needs a warp-UNIFORM leading pointer; sm_80+ (ldmatrix)
+      // needs the per-lane addresses.
       uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
-          get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+          get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 +
+              (KTraits::USE_WMMA_LOAD ? 0u : lane_idx % 16),
+          (KTraits::USE_WMMA_LOAD ? 0u : lane_idx / 16));
 
       load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n,
                                   q_stride_h, group_size, &qo_smem, tid);
@@ -3238,13 +3815,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
           v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
 
+      // sm_70 (wmma load_matrix_sync) needs a warp-UNIFORM leading pointer; sm_80+ (ldmatrix)
+      // needs the per-lane addresses.
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
-                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
-                       lane_idx % 8,
-                   (lane_idx % 16) / 8),
+                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
+                       (KTraits::USE_WMMA_LOAD ? 0u : 8 * (lane_idx / 16) + lane_idx % 8),
+                   (KTraits::USE_WMMA_LOAD ? 0u : (lane_idx % 16) / 8)),
                v_smem_offset_r = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16,
-                   lane_idx / 16),
+                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
+                       (KTraits::USE_WMMA_LOAD ? 0u : lane_idx % 16),
+                   (KTraits::USE_WMMA_LOAD ? 0u : lane_idx / 16)),
                k_smem_offset_w = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                    lane_idx % KV_THR_LAYOUT_COL),
@@ -3640,8 +4220,10 @@ __device__ __forceinline__ void vosplit_compute_pv(
 
 #pragma unroll
   for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV_FULL; ++mma_kv) {
-    // load P[mma_q tile, mma_kv tile] from p_smem into the m16k16 A-fragment
-    uint32_t a_frag[NUM_MMA_Q][4];
+    // load P[mma_q tile, mma_kv tile] from p_smem into the m16k16 A-fragment.
+    // sm_70 wmma m16n16k16 A fragment is 32 bytes (8 x uint32); allocate 8 to avoid a read
+    // overflow in the wmma mma bridge (sm80+ ldmatrix fills only the low 4).
+    uint32_t a_frag[NUM_MMA_Q][8];
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
       const uint32_t r0 = q_row_base + mma_q * 16 + lane_idx / 4;
@@ -3680,7 +4262,8 @@ __device__ __forceinline__ void vosplit_compute_pv(
       for (uint32_t local_d_offset = 0; local_d_offset < LOCAL_D_GROUP; ++local_d_offset) {
         const uint32_t local_d = local_d_base + local_d_offset;
         const uint32_t global_d = warp_vo_base + local_d;
-        uint32_t b_frag[4];
+        // sm_70 wmma m16n16k16 B fragment is 32 bytes (8 x uint32); allocate 8 (see a_frag).
+        uint32_t b_frag[8];
         if constexpr (sizeof(DTypeKV) == 1) {
           // In-loop one-byte V dequant (no staging). FP8 and NVFP4 both share a
           // 2-b128-column region for a pair of VO MMA tiles (global_d, global_d^1),
@@ -3736,11 +4319,14 @@ __device__ __forceinline__ void vosplit_compute_pv(
         } else {
           const uint32_t voff = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
               mma_kv * 16 + lane_idx % 16, global_d * VO_COLS_PER_TILE + lane_idx / 16);
-          v_smem.ldmatrix_m8n8x4_trans(voff, b_frag);
+          if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::kLinear)
+            v_smem.template wmma_ldm_b_row<typename KTraits::DTypeKV>(voff, UPCAST_STRIDE_V, b_frag);
+          else
+            v_smem.ldmatrix_m8n8x4_trans(voff, b_frag);
         }
 #pragma unroll
         for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(o_frag[mma_q][local_d], a_frag[mma_q],
+          mma::mma_sync_m16n16k16_row_row_f16f16f32<DTypeQ>(o_frag[mma_q][local_d], a_frag[mma_q],
                                                             b_frag);
         }
       }
@@ -3975,8 +4561,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       } else {
         init_states<KTraits>(variant, o_frag, m, d);
       }
+      // sm_70 (wmma load_matrix_sync) needs a warp-UNIFORM leading pointer; sm_80+ (ldmatrix)
+      // needs the per-lane addresses.
       uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
-          get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+          get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 +
+              (KTraits::USE_WMMA_LOAD ? 0u : lane_idx % 16),
+          (KTraits::USE_WMMA_LOAD ? 0u : lane_idx / 16));
 
       load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n,
                                   q_stride_h, group_size, &qo_smem, tid);
@@ -4013,10 +4603,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       [[maybe_unused]] size_t
           thr_local_kv_offset_v[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_KV_OFFSETS];
 
+      // sm_70 (wmma load_matrix_sync) needs a warp-UNIFORM leading pointer; sm_80+ (ldmatrix)
+      // needs the per-lane addresses.
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
-                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
-                       lane_idx % 8,
-                   (lane_idx % 16) / 8),
+                   get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
+                       (KTraits::USE_WMMA_LOAD ? 0u : 8 * (lane_idx / 16) + lane_idx % 8),
+                   (KTraits::USE_WMMA_LOAD ? 0u : (lane_idx % 16) / 8)),
                k_smem_offset_w = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                    lane_idx % KV_THR_LAYOUT_COL);
@@ -4029,7 +4621,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           lane_idx % KV_THR_LAYOUT_COL);
       if constexpr (!KTraits::USE_VO_SPLIT && !kRepackActive) {
         v_smem_offset_r = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-            get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16, lane_idx / 16);
+            get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
+                (KTraits::USE_WMMA_LOAD ? 0u : lane_idx % 16),
+            (KTraits::USE_WMMA_LOAD ? 0u : lane_idx / 16));
       }
       if constexpr (KTraits::USE_KV_SHARED_SMEM) {
         static_assert(UPCAST_STRIDE_K == UPCAST_STRIDE_V);
@@ -4058,7 +4652,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       } else {
 #pragma unroll
         for (uint32_t i = 0;
-             i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
+             i < NUM_MMA_KV * (KTraits::KV_IS_128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
           uint32_t page_iter, entry_idx;
           paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
                                         lane_idx / KV_THR_LAYOUT_COL +
@@ -4164,7 +4758,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           packed_page_iter_base = next_packed_page_iter_base;
 #pragma unroll
           for (uint32_t i = 0;
-               i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q;
+               i < NUM_MMA_KV * (KTraits::KV_IS_128B ? 4 : 2) / NUM_WARPS_Q;
                ++i) {
             uint32_t page_iter, entry_idx;
             paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
@@ -4231,6 +4825,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
         }
+        if constexpr (KTraits::USE_WMMA_LOAD) {
+          // sm_70: s_frag from the wmma m16n16 mma is in the wmma C fragment layout; permute it
+          // to the PTX m16n8x2 s_frag layout the logits/mask/mdo/pv/store expect, via a per-warp
+          // 16x16 smem scratch (see permute_s_frag_wmma_to_ptx).
+          for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+            for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv) {
+              permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, s_frag[mq][mkv],
+                                                  smem_storage.s_perm_ptr(warp_idx));
+            }
+          }
+        }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                   kv_head_idx);
@@ -4273,6 +4878,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                            get_warp_idx_kv<KTraits>(tid.z),
                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
         } else {
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: o_frag is the wmma m16n16 C accumulator (PV mma). Bring it to the PTX m16n8x2
+            // layout so update_mdo_states can rescale it per PTX row (the wmma C rows a thread
+            // holds do NOT align with the PTX j-group o_scale). Converted back to wmma C before the
+            // PV mma in compute_sfm_v.
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t dv = 0; dv < O_FRAG_D; ++dv) {
+                permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, o_frag[mq][dv],
+                                                    smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+          }
           update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         }
 
@@ -4315,11 +4932,27 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_VO),
               lane_idx, s_frag, o_frag, d, d_base);
         } else {
+          if constexpr (KTraits::USE_WMMA_LOAD) {
+            // sm_70: o_frag was permuted to PTX before update_mdo_states (for the per-PTX-row
+            // rescale). Convert it back to the wmma m16n16 C layout so the PV mma in compute_sfm_v
+            // can accumulate into it.
+            for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+              for (uint32_t dv = 0; dv < O_FRAG_D; ++dv) {
+                permute_frag_ptx_to_wmma_c<float>(lane_idx, o_frag[mq][dv],
+                                                  smem_storage.s_perm_ptr(warp_idx));
+              }
+            }
+          }
           compute_sfm_v<KTraits>(
               &v_smem, &v_smem_offset_r,
               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_VO),
-              lane_idx, s_frag, o_frag, d, d_base);
+              lane_idx, s_frag, o_frag, d, d_base,
+              // sm_70: pass the (kLinear/plain) V buffer + the per-warp C-permutation (float) and
+              // P-staging (half) scratch. On sm_80+ these extra args are unused (USE_WMMA_LOAD
+              // false) and the perm ptrs are nullptr there.
+              &v_smem, smem_storage.s_perm_ptr(warp_idx), warp_idx,
+              smem_storage.p_perm_ptr(warp_idx));
         }
 
         block.sync();
@@ -4344,6 +4977,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
       cp_async::wait_group<0>();
       block.sync();
+
+      if constexpr (KTraits::USE_WMMA_LOAD) {
+        // sm_70 kLinear: o_frag has accumulated in the wmma m16n16 C layout through the whole KV
+        // loop (PV mma accumulator). Now permute it once to the PTX m16n8x2 layout that
+        // threadblock_sync_mdo_states / transform_output / write_o expect.
+        for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+          for (uint32_t dv = 0; dv < O_FRAG_D; ++dv) {
+            permute_s_frag_wmma_to_ptx<KTraits>(lane_idx, warp_idx, o_frag[mq][dv],
+                                                smem_storage.s_perm_ptr(warp_idx));
+          }
+        }
+      }
 
       finalize_m<KTraits>(variant, m);
 
@@ -4558,6 +5203,22 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
                                                  typename KTraits::SharedStoragePaged,
                                                  typename KTraits::SharedStorage>;
           size_t smem_size = sizeof(SmemStorage);
+          // sm_70: de-swizzle scratch (s_perm_smem float + p_perm_smem half) is
+          // __CUDA_ARCH__-gated to 700<=arch<750, so the host sizeof excludes it; add its
+          // size when running on sm_70 or the kernel writes past the allocated dynamic smem.
+          {
+            int cc_major = 0, cc_minor = 0;
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_major,
+                                                       cudaDevAttrComputeCapabilityMajor, dev_id));
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_minor,
+                                                       cudaDevAttrComputeCapabilityMinor, dev_id));
+            if (cc_major == 7 && cc_minor == 0) {
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(float);
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(half);
+            }
+          }
           auto kernel = BatchPrefillWithRaggedKVCacheKernel<KTraits, Params>;
           // Exact final check: the analytic NUM_MMA_KV budget can slightly
           // under-count the real struct (cross-warp merge buffers, padding);
@@ -4767,6 +5428,23 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
           FLASHINFER_ERROR(err_msg.str());
         } else {
           size_t smem_size = sizeof(typename KTraits::SharedStoragePaged);
+          // sm_70: the de-swizzle scratch buffers (s_perm_smem float + p_perm_smem half) are
+          // __CUDA_ARCH__-gated to 700<=arch<750, so the host sizeof excludes them; add their
+          // size when running on sm_70, else the kernel writes past the allocated dynamic smem
+          // (out-of-bounds __shared__ write on the V100).
+          {
+            int cc_major = 0, cc_minor = 0;
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_major,
+                                                       cudaDevAttrComputeCapabilityMajor, dev_id));
+            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&cc_minor,
+                                                       cudaDevAttrComputeCapabilityMinor, dev_id));
+            if (cc_major == 7 && cc_minor == 0) {
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(float);
+              smem_size += (size_t)(KTraits::CTA_TILE_Q / 16) * KTraits::NUM_WARPS_KV * 16 * 16 *
+                                 sizeof(half);
+            }
+          }
           auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
           // Exact final check: the analytic NUM_MMA_KV budget can slightly
           // under-count the real struct (cross-warp merge buffers, padding);

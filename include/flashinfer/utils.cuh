@@ -478,8 +478,15 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         }
         return 16;
       }
+    } else if (compute_capacity.first == 7 && compute_capacity.second == 0) {
+      // SM70 (V100): use CTA_TILE_Q=16 (1x4 warp layout). The CTA=64 kernel
+      // triggers a ptxas bug (unconditional BPT.TRAP in the generated SASS)
+      // when compiled with WMMA for SM70, causing "unspecified launch failure".
+      // The CTA=16 path (NUM_WARPS_Q=1, NUM_WARPS_KV=4) compiles correctly and
+      // fits within V100's 96KB shared memory for head_dim<=128.
+      return 16;
     } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
+      // Older pre-Turing architectures: use CTA=64 (conservative default)
       return 64;
     }
   }

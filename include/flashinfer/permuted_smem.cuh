@@ -30,6 +30,7 @@ namespace flashinfer {
 enum class SwizzleMode {
   k64B,
   k128B,
+  kLinear,  // no swizzle: plain row-major b128 layout (for sm_70 wmma::load path)
 };
 
 // Use 128bit as the granularity to fetch/store data per thread to maximize memory bandwidth
@@ -48,6 +49,8 @@ template <SwizzleMode swizzle_mode, uint32_t stride>
 __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
   if constexpr (swizzle_mode == SwizzleMode::k128B) {
     return i * stride + (j ^ (i % 8));
+  } else if constexpr (swizzle_mode == SwizzleMode::kLinear) {
+    return i * stride + j;  // plain row-major b128 (no swizzle)
   } else {
     // swizzle_mode == SwizzleMode::k64B
     return i * stride + (j ^ ((i / 2) % 4));
@@ -75,6 +78,8 @@ struct smem_t {
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
       return i * stride + (j ^ (i % 8));
+    } else if constexpr (swizzle_mode == SwizzleMode::kLinear) {
+      return i * stride + j;  // plain row-major b128 (no swizzle)
     } else {
       // swizzle_mode == SwizzleMode::k64B
       static_assert(stride == 4);
@@ -96,6 +101,9 @@ struct smem_t {
         // step_size % 8 == 0
         return offset + step_size;
       }
+    } else if constexpr (swizzle_mode == SwizzleMode::kLinear) {
+      // plain row-major b128: advance by step_size b128 (no swizzle; step_idx irrelevant)
+      return offset + step_size;
     } else {
       // swizzle_mode == SwizzleMode::k64B
       static_assert(step_size == 2, "Unsupported step size");
@@ -113,6 +121,9 @@ struct smem_t {
         // step_size % 8 == 0
         return offset + step_size * row_stride;
       }
+    } else if constexpr (swizzle_mode == SwizzleMode::kLinear) {
+      // plain row advance (no swizzle xor)
+      return offset + step_size * row_stride;
     } else {
       static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
       if constexpr (step_size == 4) {
@@ -127,6 +138,28 @@ struct smem_t {
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
+  }
+
+  // sm_70 (kLinear) fragment loads via wmma (see mma.cuh wmma_load_m16n16k16_*).
+  // offset is in b128 units; (T*)(base+offset) = sub-tile's first element.
+  template <typename T>
+  __device__ __forceinline__ void wmma_ldm_a(uint32_t offset, uint32_t lead_b128, uint32_t* R) {
+    mma::wmma_load_m16n16k16_a<T>(lead_b128, R, (T*)(base + offset));
+  }
+  template <typename T>
+  __device__ __forceinline__ void wmma_ldm_b_col(uint32_t offset, uint32_t lead_b128, uint32_t* R) {
+    mma::wmma_load_m16n16k16_b_col<T>(lead_b128, R, (T*)(base + offset));
+  }
+  template <typename T>
+  __device__ __forceinline__ void wmma_ldm_b_row(uint32_t offset, uint32_t lead_b128, uint32_t* R) {
+    mma::wmma_load_m16n16k16_b_row<T>(lead_b128, R, (T*)(base + offset));
+  }
+
+  // sm_70: raw element pointer to the (de-swizzled plain) sub-tile top-left at b128 offset.
+  // For the wmma m16n8k8 smem-based mma (mma::wmma_mma_m16n16k16_sm).
+  template <typename T>
+  __device__ __forceinline__ T* plain_ptr(uint32_t offset) {
+    return reinterpret_cast<T*>(base + offset);
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t offset, uint32_t* R) {
