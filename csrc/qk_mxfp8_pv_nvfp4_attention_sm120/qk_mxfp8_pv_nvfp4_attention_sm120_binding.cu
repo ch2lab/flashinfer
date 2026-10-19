@@ -42,6 +42,9 @@ constexpr DLDataType dl_bfloat16 = DLDataType{kDLBfloat, 16, 1};
 #define CHECK_CUDA(x) \
   TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
+#define CHECK_LASTDIM_CONTIGUOUS(x) \
+  TVM_FFI_ICHECK_EQ(x.stride(x.ndim() - 1), 1) \
+      << #x " must be contiguous in the last dimension";
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
   CHECK_CONTIGUOUS(x)
@@ -172,7 +175,10 @@ void fwd(TensorView q_fp8, TensorView k_fp8, TensorView v_fp4_t, TensorView q_sc
   CHECK_INPUT(q_scale);
   CHECK_INPUT(k_scale);
   CHECK_INPUT(v_scale_t);
-  CHECK_INPUT(out);
+  // ``out`` is written through its strides (may be a transposed activation
+  // view); only dense rows are required.
+  CHECK_CUDA(out);
+  CHECK_LASTDIM_CONTIGUOUS(out);
   if (maybe_lse.has_value()) {
     CHECK_INPUT(maybe_lse.value());
   }

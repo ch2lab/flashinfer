@@ -50,6 +50,21 @@ def _check_cuda_contiguous(name: str, tensor: torch.Tensor) -> None:
         raise ValueError(f"{name} must be contiguous, got stride={tensor.stride()}")
 
 
+def _check_lastdim_contiguous(name: str, tensor: torch.Tensor) -> None:
+    """Strided tensors are fine for every op here as long as rows are dense."""
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor, got device={tensor.device}")
+    if tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must be contiguous in the last dimension, "
+            f"got stride={tensor.stride()}"
+        )
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
 def _check_same_device(
     name: str,
     tensor: torch.Tensor,
@@ -357,6 +372,254 @@ def nvfp4_prefill_convert(
     return q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t
 
 
+_DEFAULT_KV_CHUNK = 32768
+_DEFAULT_Q_CHUNK = 2048
+
+
+def _paged_side(
+    side_data: torch.Tensor,
+    side_sf: torch.Tensor,
+    block_ids: torch.Tensor,
+    seq_len: int,
+    keep: int,
+    out_len: int,
+    hnd: bool,
+) -> torch.Tensor:
+    """Gather one KV chunk into the row-interleaved ``(Hk, out_len, F)`` form.
+
+    ``side_data``/``side_sf`` are the per-side cache views described in
+    ``nvfp4_side_dequant``. Gathering along the still-paged block axis first
+    lets ``index_select`` produce a dense ``(Hk, nblocks, page, width)``
+    tensor, so the subsequent reshape is free and only the copy into the
+    interleaved row buffer touches memory.
+
+    Rows past ``keep`` are zeroed: the query-side conversion pads with zeros
+    for the same tail, which keeps the 64/128-token tiles the quantizers
+    permute indistinguishable from the reference path.
+    """
+    perm = (1, 0, 2, 3) if hnd else (2, 0, 1, 3)
+    data = torch.index_select(side_data.permute(perm), 1, block_ids)
+    # Block scales reach us as e4m3 or uint8 depending on the cache view;
+    # both are one byte per element, so reinterpret and gather the same way.
+    sf = torch.index_select(side_sf.view(torch.uint8).permute(perm), 1, block_ids)
+    Hk = data.shape[0]
+    half_dim = data.shape[-1]
+    n_sf = sf.shape[-1]
+    side = torch.empty(
+        (Hk, out_len, half_dim + n_sf), dtype=torch.uint8, device=data.device
+    )
+    side[:, :seq_len, :half_dim] = data.reshape(Hk, seq_len, half_dim)
+    side[:, :seq_len, half_dim:] = sf.reshape(Hk, seq_len, n_sf)
+    if out_len > keep:
+        side[:, keep:, :].zero_()
+    return side
+
+
+def nvfp4_prefill_convert_paged(
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+    block_ids: torch.Tensor,
+    kv_len: int,
+    q_bf16: torch.Tensor,
+    k_scale_global: float,
+    v_scale_global: float,
+    q_scale_global: float,
+    *,
+    page_size: int,
+    hnd: bool,
+    chunk_tokens: int = _DEFAULT_KV_CHUNK,
+    q_chunk_tokens: int = _DEFAULT_Q_CHUNK,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    r"""Convert a paged NVFP4 KV cache + BF16 query into qk_mxfp8 fwd inputs.
+
+    Produces exactly the same bytes as ``nvfp4_prefill_convert`` for the same
+    KV content, but reads the cache through ``block_ids`` and converts it in
+    ``chunk_tokens``-token pieces that are quantized straight into the final
+    kernel buffers. Working memory is therefore O(chunk_tokens) instead of
+    O(kv_len); only the six kernel inputs (which the dense fwd kernel needs in
+    full) scale with the sequence length.
+
+    Chunking is exact because every conversion step is local to a token (or to
+    a 16-token group along the V sequence axis): dequantization is per token,
+    the MXFP8 group scale covers 32 elements inside one token, and the NVFP4
+    V scale covers 16 consecutive tokens. Boundaries are kept 128-aligned, so
+    the 64/128-token tiles used by the permute and scale layouts never split.
+
+    Args:
+        k_data, v_data: uint8 paged cache sides, ``(num_blocks, Hk, page, D/2)``
+            when ``hnd`` else ``(num_blocks, page, Hk, D/2)``.
+        k_sf, v_sf: uint8 paged block scales with the same layout and
+            ``D/16`` columns.
+        block_ids: int32/int64 ``(nblocks,)`` physical block ids of this
+            request, in logical order.
+        kv_len: number of valid tokens in the request.
+        q_bf16: BF16 query ``(1, Hq, M, D)``; only the last dimension must be
+            contiguous, so a strided ``(1, Hq, M, D)`` view of the
+            ``(M, Hq, D)`` activation buffer is accepted.
+        *_scale_global: the layer's ``_q_scale_float`` / ``_k_scale_float`` /
+            ``_v_scale_float``.
+
+    Returns:
+        ``(q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t)`` with
+        128-padded M/N physical extents.
+    """
+    for name, t in (("k_data", k_data), ("v_data", v_data)):
+        _check_lastdim_contiguous(name, t)
+        if t.dtype != torch.uint8:
+            raise ValueError(f"{name} must be a uint8 tensor, got {t.dtype}")
+    for name, t in (("k_sf", k_sf), ("v_sf", v_sf)):
+        _check_lastdim_contiguous(name, t)
+        if t.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise ValueError(
+                f"{name} must be uint8 or float8_e4m3fn, got {t.dtype}"
+            )
+    if k_data.shape != v_data.shape or k_sf.shape != v_sf.shape:
+        raise ValueError(
+            "K and V paged views must have matching shapes, "
+            f"got k_data={tuple(k_data.shape)} v_data={tuple(v_data.shape)} "
+            f"k_sf={tuple(k_sf.shape)} v_sf={tuple(v_sf.shape)}"
+        )
+    if k_sf.shape[:-1] != k_data.shape[:-1]:
+        raise ValueError(
+            "cache data and scale views must share the paged layout, "
+            f"got data={tuple(k_data.shape)} scale={tuple(k_sf.shape)}"
+        )
+    if block_ids.ndim != 1:
+        raise ValueError(f"block_ids must be 1-D, got shape={tuple(block_ids.shape)}")
+    if block_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"block_ids must be int32/int64, got {block_ids.dtype}")
+    if not q_bf16.is_cuda or q_bf16.dtype not in _SUPPORTED_QKV_DTYPES:
+        raise ValueError(
+            "q_bf16 must be a CUDA float16/bfloat16 tensor, "
+            f"got device={q_bf16.device} dtype={q_bf16.dtype}"
+        )
+    _check_lastdim_contiguous("q_bf16", q_bf16)
+    if q_bf16.ndim == 3:
+        q_bf16 = q_bf16.unsqueeze(0)
+    if q_bf16.ndim != 4 or q_bf16.shape[0] != 1:
+        raise ValueError(
+            "q_bf16 must have shape (1, Hq, M, D) or (Hq, M, D), "
+            f"got shape={tuple(q_bf16.shape)}"
+        )
+
+    Hk = k_data.shape[1] if hnd else k_data.shape[2]
+    half_dim = k_data.shape[-1]
+    n_sf = k_sf.shape[-1]
+    D = 2 * half_dim
+    if q_bf16.shape[3] != D:
+        raise ValueError(
+            f"q_bf16 head_dim must be {D} for this cache, got {q_bf16.shape[3]}"
+        )
+    Hq, M = q_bf16.shape[1], q_bf16.shape[2]
+    if M <= 0 or kv_len <= 0:
+        raise ValueError(
+            f"query and cache sequence lengths must be positive, got M={M} kv_len={kv_len}"
+        )
+    if Hq < Hk or Hq % Hk != 0:
+        raise ValueError(f"Hq={Hq} must be a multiple of Hk={Hk}")
+    if page_size <= 0 or _TOKEN_BLOCK_SIZE % page_size != 0:
+        raise ValueError(
+            f"page_size={page_size} must divide the {_TOKEN_BLOCK_SIZE}-token block"
+        )
+    if chunk_tokens % _TOKEN_BLOCK_SIZE != 0 or q_chunk_tokens % _TOKEN_BLOCK_SIZE != 0:
+        raise ValueError(
+            "chunk_tokens and q_chunk_tokens must be multiples of "
+            f"{_TOKEN_BLOCK_SIZE}"
+        )
+    nblocks = (kv_len + page_size - 1) // page_size
+    if block_ids.numel() < nblocks:
+        raise ValueError(
+            f"block_ids holds {block_ids.numel()} blocks, need {nblocks} for "
+            f"kv_len={kv_len} at page_size={page_size}"
+        )
+
+    device = q_bf16.device
+    N_pad = _round_up(kv_len, _TOKEN_BLOCK_SIZE)
+    M_pad = _round_up(M, _TOKEN_BLOCK_SIZE)
+
+    module = get_qk_mxfp8_pv_nvfp4_attention_sm120_module()
+    q_fp8 = torch.empty((1, Hq, M_pad, D), device=device, dtype=torch.float8_e4m3fn)
+    q_scale = torch.empty(
+        (1, Hq, M_pad, D // 32), device=device, dtype=torch.uint8
+    )
+    k_fp8 = torch.empty((1, Hk, N_pad, D), device=device, dtype=torch.float8_e4m3fn)
+    k_scale = torch.empty((1, Hk, N_pad, D // 32), device=device, dtype=torch.uint8)
+    v_fp4_t = torch.empty((1, Hk, D, N_pad // 2), device=device, dtype=torch.uint8)
+    v_scale_t = torch.empty(
+        (1, Hk, D, N_pad // 16), device=device, dtype=torch.float8_e4m3fn
+    )
+
+    # Query: scale in fp32 (FA2 dequant semantics) but only a slice at a time.
+    for q_start in range(0, M, q_chunk_tokens):
+        q_end = min(q_start + q_chunk_tokens, M)
+        q_out_end = q_start + _round_up(q_end - q_start, _TOKEN_BLOCK_SIZE)
+        q_in = (q_bf16[:, :, q_start:q_end, :].float() * q_scale_global).to(
+            q_bf16.dtype
+        )
+        if q_out_end > q_end:
+            q_in = torch.nn.functional.pad(q_in, (0, 0, 0, q_out_end - q_end))
+        module.scaled_fp8_quant(
+            q_in,
+            q_fp8[0:1, :, q_start:q_out_end, :],
+            q_scale[0:1, :, q_start:q_out_end, :],
+            _HND_LAYOUT,
+        )
+
+    # KV: gather -> dequantize -> quantize, one 128-aligned chunk at a time.
+    # K's MXFP8 scale (32 elements inside a token) and V's NVFP4 scale
+    # (16-token groups) are both chunk-local, so the split is exact. Each
+    # chunk writes its whole 128-aligned window (rows past ``keep`` are zero),
+    # so every byte of the dense buffers is written by a quantizer.
+    v_scale_tiles = v_scale_t.view(Hk, D // 64, N_pad // 64, 256)
+    pos = 0
+    while pos < kv_len:
+        take = min(chunk_tokens, kv_len - pos)
+        blk_start = pos // page_size
+        blk_end = min(nblocks, (pos + take + page_size - 1) // page_size)
+        sub_ids = block_ids[blk_start:blk_end]
+        seq_len = (blk_end - blk_start) * page_size
+        out_len = _round_up(seq_len, _TOKEN_BLOCK_SIZE)
+        keep = min(seq_len, kv_len - pos)
+
+        k_side = _paged_side(k_data, k_sf, sub_ids, seq_len, keep, out_len, hnd)
+        v_side = _paged_side(v_data, v_sf, sub_ids, seq_len, keep, out_len, hnd)
+        k_bf16 = nvfp4_side_dequant(k_side, k_scale_global)
+        v_bf16 = nvfp4_side_dequant(v_side, v_scale_global)
+        module.scaled_fp8_quant_permute(
+            k_bf16.unsqueeze(0),
+            k_fp8[0:1, :, pos : pos + out_len, :],
+            k_scale[0:1, :, pos : pos + out_len, :],
+            _HND_LAYOUT,
+        )
+        # V's block-scale layout is tiled per 64 tokens inside each 64-row
+        # head slab, so the chunk writes its own tile-aligned window instead
+        # of a plain slice of the parent.
+        v_sf_chunk = torch.empty(
+            (1, Hk, D, out_len // 16), device=device, dtype=torch.float8_e4m3fn
+        )
+        module.scaled_fp4_quant_trans(
+            v_bf16.unsqueeze(0),
+            v_fp4_t[0:1, :, :, pos // 2 : (pos + out_len) // 2],
+            v_sf_chunk,
+            _HND_LAYOUT,
+        )
+        v_scale_tiles[:, :, pos // 64 : (pos + out_len) // 64, :].copy_(
+            v_sf_chunk.view(Hk, D // 64, out_len // 64, 256)
+        )
+        pos += out_len
+
+    return q_fp8, k_fp8, v_fp4_t, q_scale, k_scale, v_scale_t
+
+
 def _check_inputs(
     q_fp8: torch.Tensor,
     k_fp8: torch.Tensor,
@@ -574,7 +837,7 @@ def qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
             dtype=out_dtype,
         )
     else:
-        _check_cuda_contiguous("out", out)
+        _check_lastdim_contiguous("out", out)
         _check_same_device("out", out, "q_fp8", q_fp8)
         if tuple(out.shape) != (batch, num_qo_heads, seq_len_q, head_dim):
             raise ValueError(
